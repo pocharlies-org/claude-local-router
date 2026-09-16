@@ -346,7 +346,7 @@ const server = http.createServer((req, res) => {
     // para saber por que el desvio esta apagado.
     return quotaGate().then((q) => {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, port: PORT, litellm: LITELLM.url.host, local_re: LOCAL_RE.source, mixed: MIXED, bad_keys: BAD_KEYS,
+      res.end(JSON.stringify({ ok: true, port: PORT, gateway: LITELLM.url.host, local_re: LOCAL_RE.source, mixed: MIXED, bad_keys: BAD_KEYS,
         fallback_model: FALLBACK_MODEL || 'off', fallback_beta: FALLBACK_BETA, fallback_slow_ms: FALLBACK_SLOW_MS, fallback_stalled: FALLBACK_STALLED,
         fallback_allowed: q.allow, fallback_reason: q.reason, fallback_quota: q.detail || null,
         cloud_fallback_model: CLOUD_FALLBACK_MODEL || 'off', cloud_fallback_re: CLOUD_FALLBACK_RE.source,

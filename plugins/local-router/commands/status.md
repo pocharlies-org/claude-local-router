@@ -15,8 +15,10 @@ curl -fsS -m 5 "http://127.0.0.1:${CLAUDE_ROUTER_PORT:-18791}/-/health"
 
 Then report, in this order, **translating rather than dumping** the JSON:
 
-1. **Routing** — `litellm` is the gateway local models go to; `local_re` is the regex a
+1. **Routing** — `gateway` is the host local models go to; `local_re` is the regex a
    `model` must match to be sent there. Anything not matching goes to Anthropic untouched.
+   (`gateway` is the config; `litellm` further down is the *counter* of requests served by
+   it. Same word in older builds meant the host — it collided with the counter.)
 2. **Traffic** — `anthropic` vs `litellm` counts, plus `errors` and `blocked`. A `litellm`
    count of 0 after a session on a local model means routing is not actually happening
    (usually `ANTHROPIC_BASE_URL` is not set in `~/.claude/settings.json`).
