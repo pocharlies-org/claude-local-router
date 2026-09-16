@@ -79,7 +79,7 @@ REAL="$("$NODE" -p 'process.execPath' 2>/dev/null || true)"
 log "node $NODE"
 
 [ -f "$HERE/bin/claude-router.js" ] || die "falta bin/claude-router.js"
-node --check "$HERE/bin/claude-router.js" || die "bin/claude-router.js no parsea"
+"$NODE" --check "$HERE/bin/claude-router.js" || die "bin/claude-router.js no parsea"
 
 # ---------------------------------------------------------------- 1. binary
 mkdir -p "$HOME/.local/bin" "$ENV_DIR"
