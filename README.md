@@ -123,6 +123,31 @@ The repo doubles as a plugin marketplace. It ships no daemon of its own — the 
 Node ≥ 18 (no dependencies), Claude Code, and a gateway that speaks the Anthropic
 `/v1/messages` API — LiteLLM does this natively.
 
+## Troubleshooting
+
+**`curl` reaches the gateway but the router gets `EHOSTUNREACH` to the same host.**
+Almost always interface selection on a multi-homed machine. If two interfaces sit on the
+same subnet (e.g. Wi-Fi `en0` and a Thunderbolt/USB dock `en8`, both `192.168.50.0/24`),
+`curl` picks the working one and Node picks the other — and the connect fails even though
+`nc -z -s <bad-ip> <gateway> 443` says "succeeded", because the failure is at connect/ARP
+time, not at the port check.
+
+- Confirm it: the router's log line names the source IP it used — `… Local
+  (192.168.50.59:56610)`. If that IP isn't the interface you expect, that's the cause.
+- Fix without touching Node: point `ANTHROPIC_BASE_URL` at a host that resolves to a
+  **public** IP (routed via the default gateway, so interface choice stops mattering).
+  The LAN hostname resolving to a LAN IP is the trigger.
+- A reload applies it live: `kill -HUP $(pgrep -f claude-router.js)`.
+
+**`/-/health` shows a model routed local returning Anthropic errors.** The model name
+didn't match `local_re`. Add its prefix to `CLAUDE_ROUTER_LOCAL_RE` and reload.
+
+**The CLI rejects `--model <local-model>` with `unrecognized_model`,** even with a
+`modelPicker` row that has `behavesAs`: the `--model` flag validates against the CLI's
+built-in catalog on some versions, a different path than the interactive picker. Use the
+picker (`/model`) for local models, and set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the model's
+real window so auto-compact doesn't assume 200k.
+
 ## Security
 
 - Binds `127.0.0.1` exclusively; it is not reachable off-box.
