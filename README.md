@@ -110,13 +110,25 @@ The ones you are most likely to touch:
 
 ## Claude Code plugin
 
-The repo doubles as a plugin marketplace. It ships no daemon of its own — the plugin adds a
-`/router-status` command that reads `/-/health` and tells you what is routed where:
+The repo doubles as a plugin marketplace. It ships no daemon of its own — it reads
+`/-/health` and explains it:
 
 ```
 /plugin marketplace add pocharlies-org/claude-local-router
 /plugin install local-router@claude-local-router
 ```
+
+Commands are namespaced by plugin, so they are **`/local-router:status`** and
+**`/local-router:reload`** — not `/router-status`. From a shell, the same works headless:
+
+```sh
+claude -p "/local-router:status"
+```
+
+`status` explains routing, traffic, both fallbacks (including *why* one is blocked) and
+stall pressure; `reload` re-reads the gateway URL and key on `SIGHUP` without dropping
+in-flight streams. Install with `claude plugin install …`; `claude plugin details
+local-router` shows the inventory and token cost.
 
 ## Requirements
 
