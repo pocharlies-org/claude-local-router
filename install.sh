@@ -262,7 +262,7 @@ curl -fsS -m 5 "$HEALTH_URL" >"$TMP_H"
 python3 - "$TMP_H" <<'PY'
 import json, sys
 h = json.load(open(sys.argv[1]))
-print("    gateway   %s" % h.get("litellm"))
+print("    gateway   %s" % h.get("gateway"))
 print("    locales   %s" % h.get("local_re"))
 print("    fallback  %s (permitido: %s)" % (h.get("fallback_model"), h.get("fallback_allowed")))
 PY
