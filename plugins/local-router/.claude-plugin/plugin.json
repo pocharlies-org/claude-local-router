@@ -1,0 +1,11 @@
+{
+  "name": "local-router",
+  "description": "Inspect the local model router from inside a Claude Code session: which models go to your gateway and which to Anthropic, live request counters, and whether the quota-gated fallbacks are currently allowed — and why not.",
+  "author": {
+    "name": "pocharlies-org",
+    "url": "https://github.com/pocharlies-org"
+  },
+  "homepage": "https://github.com/pocharlies-org/claude-local-router",
+  "license": "MIT",
+  "keywords": ["router", "litellm", "vllm", "local-models", "observability", "proxy"]
+}

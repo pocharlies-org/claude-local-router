@@ -1,0 +1,6 @@
+# The only secret in this project lives outside it, on each machine.
+env
+!env.example
+*.local
+.DS_Store
+node_modules/
