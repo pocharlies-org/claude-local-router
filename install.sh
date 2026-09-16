@@ -54,14 +54,27 @@ if [ "${1:-}" = "--uninstall" ]; then
 fi
 
 # ---------------------------------------------------------------- preflight
-command -v node >/dev/null 2>&1 || die "node no está en el PATH"
-NODE="$(command -v node)"
-NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-[ "$NODE_MAJOR" -ge 18 ] || die "requiere node >= 18, hay $(node -v)"
+# Neither launchd nor a non-interactive ssh shell loads your shell rc, so on macOS
+# /opt/homebrew/bin is frequently missing from PATH even when node is installed. Search
+# the usual places before giving up — the service needs an absolute path regardless.
+NODE=""
+for c in "${NODE_OVERRIDE:-}" \
+         "$(command -v node 2>/dev/null || true)" \
+         /opt/homebrew/bin/node /usr/local/bin/node \
+         "$HOME/.volta/bin/node" \
+         $(ls -d "$HOME"/.nvm/versions/node/*/bin/node 2>/dev/null | sort -V | tail -1) \
+         $(ls -d "$HOME"/.local/share/mise/installs/node/*/bin/node 2>/dev/null | sort -V | tail -1) \
+         $(brew --prefix 2>/dev/null | sed 's|$|/bin/node|'); do
+  [ -n "$c" ] && [ -x "$c" ] && NODE="$c" && break
+done
+[ -n "$NODE" ] || die "no encuentro node. Instálalo (brew install node) o indica la ruta:
+    NODE_OVERRIDE=/ruta/al/node ./install.sh"
+NODE_MAJOR="$("$NODE" -p 'process.versions.node.split(".")[0]')"
+[ "$NODE_MAJOR" -ge 18 ] || die "requiere node >= 18, hay $("$NODE" -v) en $NODE"
 
 # launchd/systemd do not inherit your shell PATH, so a shim or version-manager stub is
 # not enough. process.execPath is the real binary, and portable across BSD/GNU readlink.
-REAL="$(node -p 'process.execPath' 2>/dev/null || true)"
+REAL="$("$NODE" -p 'process.execPath' 2>/dev/null || true)"
 [ -n "$REAL" ] && [ -x "$REAL" ] && NODE="$REAL"
 log "node $NODE"
 
