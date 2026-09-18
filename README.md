@@ -44,25 +44,47 @@ CLI's model picker stops being a picker. Routing per-model is the point.
   at the next outage.
 - `SIGHUP` reloads the gateway URL/key without dropping the listener.
 
+## The plugin owns the router
+
+The router and the Claude Code plugin are one artifact. **The plugin is the only thing that
+deploys the router** — there is no separate router install:
+
+- The router binary ships **inside** the plugin (`plugins/local-router/bin/claude-router.js`).
+- A **`SessionStart` hook** runs `scripts/deploy.sh` on every session. It is a fast no-op
+  (silent, no work) unless the deployed router differs from the bundled one or the service
+  is down.
+- The deployed bytes change **only when you update the plugin** (updating rewrites the cache
+  with the new bundled binary). So *to deploy a new router, you update the plugin* — that is
+  the whole dependency, enforced by structure, not docs.
+- `/local-router:install` runs the same deployer with `--force` for an immediate redeploy.
+
+`deploy.sh` (bundled in the plugin) does the actual work: copies the router to
+`~/.local/bin/claude-router.js`, creates `~/.config/claude-local/env` from `env.example` if
+absent (never overwrites), installs a **launchd** agent (macOS) or **systemd --user** unit
+(Linux) with the absolute `node` path, and patches `~/.claude/settings.json`
+(`env.ANTHROPIC_BASE_URL` + missing `modelPicker` rows), backing it up and preserving every
+existing key.
+
 ## Install
+
+Fastest — the plugin deploys the router itself:
+
+```
+/plugin marketplace add pocharlies-org/claude-local-router
+/plugin install local-router@claude-local-router
+```
+
+The next session's `SessionStart` hook deploys the router. For it now, without waiting,
+`/local-router:install`.
+
+Or bootstrap from a clone (installs the plugin, then deploys once so you don't wait):
 
 ```sh
 git clone https://github.com/pocharlies-org/claude-local-router
 cd claude-local-router && ./install.sh
 ```
 
-The installer is idempotent and:
-
-1. copies the router to `~/.local/bin/claude-router.js`;
-2. creates `~/.config/claude-local/env` from [`env.example`](env.example) if absent — **it
-   never overwrites an existing one**;
-3. installs a **launchd** agent (macOS) or **systemd --user** unit (Linux), baking in the
-   absolute `node` path, because neither service manager inherits your shell `PATH`;
-4. patches `~/.claude/settings.json` — adds `env.ANTHROPIC_BASE_URL` and appends any
-   missing `modelPicker` entries. It **backs the file up first, preserves every existing
-   key, and adds no duplicates**.
-
-Then fill in your gateway URL and key in `~/.config/claude-local/env` and:
+Either way, fill in your gateway URL and key in `~/.config/claude-local/env` and:
 
 ```sh
 # macOS
@@ -108,27 +130,19 @@ The ones you are most likely to touch:
 > Without one the gate fails closed anyway, but `off` states the intent and keeps
 > `/-/health` honest.
 
-## Claude Code plugin
+## Commands
 
-The repo doubles as a plugin marketplace. It ships no daemon of its own — it reads
-`/-/health` and explains it:
+Namespaced by plugin. From a shell: `claude -p "/local-router:status"`.
 
-```
-/plugin marketplace add pocharlies-org/claude-local-router
-/plugin install local-router@claude-local-router
-```
+- **`/local-router:install`** — deploy/redeploy the router from the plugin's bundled binary
+  (`deploy.sh --force`). The only way the router gets placed.
+- **`/local-router:status`** — explain `/-/health`: routing, traffic, both fallbacks
+  (including *why* one is blocked), and stall pressure.
+- **`/local-router:reload`** — re-read the gateway URL/key on `SIGHUP` without dropping
+  in-flight streams.
 
-Commands are namespaced by plugin, so they are **`/local-router:status`** and
-**`/local-router:reload`** — not `/router-status`. From a shell, the same works headless:
-
-```sh
-claude -p "/local-router:status"
-```
-
-`status` explains routing, traffic, both fallbacks (including *why* one is blocked) and
-stall pressure; `reload` re-reads the gateway URL and key on `SIGHUP` without dropping
-in-flight streams. Install with `claude plugin install …`; `claude plugin details
-local-router` shows the inventory and token cost.
+`claude plugin details local-router` shows the inventory (3 commands + the SessionStart hook)
+and token cost.
 
 ## Requirements
 

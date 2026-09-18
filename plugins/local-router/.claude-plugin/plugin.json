@@ -1,6 +1,6 @@
 {
   "name": "local-router",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Inspect the local model router from inside a Claude Code session: which models go to your gateway and which to Anthropic, live request counters, and whether the quota-gated fallbacks are currently allowed — and why not.",
   "author": {
     "name": "pocharlies-org",

@@ -9,14 +9,14 @@
   "plugins": [
     {
       "name": "local-router",
-      "description": "Inspect the local model router from inside a session: what is routed where, live counters, and why a fallback is armed or blocked.",
+      "description": "Bundles and deploys the local model router (SessionStart hook + /local-router:install), and inspects it live: routing, counters, and why a fallback is armed or blocked.",
       "author": {
         "name": "pocharlies-org"
       },
       "category": "developer-tools",
       "source": "./plugins/local-router",
       "homepage": "https://github.com/pocharlies-org/claude-local-router",
-      "version": "1.0.0"
+      "version": "2.0.0"
     }
   ]
 }
