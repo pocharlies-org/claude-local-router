@@ -34,7 +34,7 @@ PORT="${CLAUDE_ROUTER_PORT:-18791}"
 # proxy-claude/systemd/claude-router.service y un test de CI peta si divergen: aqui
 # hubo un default de dos modelos mientras el router publicaba nueve, y cada sesion
 # nueva se llevaba por delante los cuatro perfiles de chat de OWU-50.
-ROUTER_MODELS="${CLAUDE_ROUTER_MODELS:-${ROUTER_MODELS:-qwen38-flash-next,qwen38-flash-next-uncensored,tooling,alibaba-q38-flash,alibaba-q38-max,q38-flash,q38-flash-think,q38-flash-u,q38-flash-u-think}}"
+ROUTER_MODELS="${CLAUDE_ROUTER_MODELS:-${ROUTER_MODELS:-qwen38-flash-next,qwen38-flash-next-uncensored,tooling,alibaba-q38-flash,alibaba-q38-max,q38-flash,q38-flash-u}}"
 # LOCAL_RE decide que NO se va a Anthropic. Sin `q38-` en la regex, los cuatro
 # perfiles de chat pegan contra la API de Anthropic y el CLI corta con 404.
 ROUTER_LOCAL_RE="${CLAUDE_ROUTER_LOCAL_RE:-^(qwen|tooling|or-|alibaba-|q38-|litellm/)}"
