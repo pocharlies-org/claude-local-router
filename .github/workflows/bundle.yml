@@ -1,0 +1,90 @@
+name: Bundle
+
+# El binario empaquetado es lo que el SessionStart hook escribe en
+# ~/.local/bin/claude-router.js en CADA sesion de Claude Code. Un bundle que no
+# parsea, o cuyos defaults de despliegue contradicen al propio binario, se
+# instala igual y se nota horas despues.
+#
+# La comparacion contra la fuente (proxy-claude) no puede vivir aqui: ese repo
+# es privado y este workflow es publico. Vive en
+# proxy-claude/.github/workflows/bundle-drift.yml, que si puede leer este repo.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: El router empaquetado parsea
+        run: node --check plugins/local-router/bin/claude-router.js
+
+      - name: deploy.sh no desmiente al binario
+        # deploy.sh escribe la unidad systemd / el plist con defaults propios. Si
+        # esos defaults no coinciden con los que el binario lleva dentro, instalar
+        # el plugin Y LUEGO reiniciar el servicio da un router distinto del que
+        # acaba de desplegar el hook — que es exactamente como se perdieron los
+        # cuatro perfiles q38-* el 21-09-2026.
+        run: |
+          set -euo pipefail
+          ROUTER=plugins/local-router/bin/claude-router.js
+          DEPLOY=plugins/local-router/scripts/deploy.sh
+
+          fail() { echo "::error::$*"; exit 1; }
+
+          # default de CLAUDE_ROUTER_MODELS dentro del binario
+          bin_models=$(node -e '
+            const src = require("fs").readFileSync(process.argv[1], "utf8");
+            const m = src.match(/process\.env\.CLAUDE_ROUTER_MODELS([\s\S]*?)\.split\(/);
+            if (!m) { console.error("no encuentro el default de CLAUDE_ROUTER_MODELS en el binario"); process.exit(1); }
+            const after = m[1].slice(m[1].indexOf("||") + 2);
+            const ids = [...after.matchAll(/["\x27]([^"\x27]+)["\x27]/g)].map((x) => x[1]);
+            if (!ids.length) { console.error("el default de CLAUDE_ROUTER_MODELS no tiene literales"); process.exit(1); }
+            console.log(ids.join("").split(",").map((s) => s.trim()).filter(Boolean).join(","));
+          ' "$ROUTER")
+
+          # default que deploy.sh escribe en la unidad
+          unit_models=$(sed -n 's/^ROUTER_MODELS="\${CLAUDE_ROUTER_MODELS:-\${ROUTER_MODELS:-\(.*\)}}"/\1/p' "$DEPLOY")
+          [ -n "$unit_models" ] || fail "deploy.sh ya no extrae el default de ROUTER_MODELS como se espera"
+
+          [ "$bin_models" = "$unit_models" ] || fail "deploy.sh publica '$unit_models' pero el binario por defecto publica '$bin_models'"
+
+          bin_re=$(node -e '
+            const src = require("fs").readFileSync(process.argv[1], "utf8");
+            const m = src.match(/CLAUDE_ROUTER_LOCAL_RE\s*\|\|\s*(.)((?:\\.|[^\\])*?)\1\s*,/);
+            if (!m) { console.error("no encuentro el default de LOCAL_RE en el binario"); process.exit(1); }
+            console.log(m[2]);
+          ' "$ROUTER")
+
+          unit_re=$(sed -n 's/^ROUTER_LOCAL_RE="\${CLAUDE_ROUTER_LOCAL_RE:-\(.*\)}"/\1/p' "$DEPLOY")
+          [ -n "$unit_re" ] || fail "deploy.sh no define ROUTER_LOCAL_RE"
+          [ "$bin_re" = "$unit_re" ] || fail "deploy.sh escribe LOCAL_RE='$unit_re' pero el binario usa '$bin_re'"
+
+          # Y la unidad tiene que llevar las dos variables, o el servicio arranca con
+          # otros valores en cuanto alguien hace daemon-reload + restart.
+          grep -q 'Environment=CLAUDE_ROUTER_MODELS=$ROUTER_MODELS' "$DEPLOY" || fail "la unidad systemd no fija CLAUDE_ROUTER_MODELS"
+          grep -q 'Environment=CLAUDE_ROUTER_LOCAL_RE=$ROUTER_LOCAL_RE' "$DEPLOY" || fail "la unidad systemd no fija CLAUDE_ROUTER_LOCAL_RE"
+          grep -q '<key>CLAUDE_ROUTER_LOCAL_RE</key>' "$DEPLOY" || fail "el plist de launchd no fija CLAUDE_ROUTER_LOCAL_RE"
+
+          # Ningun knob que el binario ya no lee puede seguir apareciendo en el deploy.
+          for dead in CLAUDE_ROUTER_FALLBACK_MODEL CLAUDE_ROUTER_CLOUD_FALLBACK_MODEL CLAUDE_ROUTER_PANEL_URL; do
+            if grep -q "$dead" "$DEPLOY" && ! grep -q "$dead" "$ROUTER"; then
+              fail "deploy.sh sigue poniendo $dead, que el binario ya no lee"
+            fi
+          done
+
+          echo "defaults coherentes: $(echo "$bin_models" | tr ',' '\n' | wc -l) modelos, LOCAL_RE=$bin_re"
+
+      - name: El hook SessionStart sigue apuntando al deployer
+        run: |
+          set -euo pipefail
+          grep -q 'scripts/deploy.sh' plugins/local-router/hooks/hooks.json \
+            || { echo "::error::el SessionStart hook ya no ejecuta deploy.sh"; exit 1; }
