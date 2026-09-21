@@ -7,7 +7,7 @@ A ~470-line, zero-dependency Node proxy that sits on `127.0.0.1` and routes each
 
 | request | goes to |
 |---|---|
-| `model` matches `CLAUDE_ROUTER_LOCAL_RE` (default `^(qwen\|tooling\|or-\|litellm/)`) | your OpenAI/Anthropic-compatible gateway (LiteLLM, vLLM, OpenRouter…) |
+| `model` matches `CLAUDE_ROUTER_LOCAL_RE` (default `^(qwen\|tooling\|or-\|alibaba-\|q38-\|litellm/)`) | your OpenAI/Anthropic-compatible gateway (LiteLLM, vLLM, OpenRouter…) |
 | everything else | `api.anthropic.com`, byte-for-byte passthrough |
 
 So `opus`, `sonnet` and `fable` keep working exactly as before — same OAuth, same
@@ -28,26 +28,45 @@ CLI's model picker stops being a picker. Routing per-model is the point.
 - **`GET /v1/models`** served locally. Without this the CLI validates `--model` against
   Anthropic's catalogue and fails intermittently with `unrecognized_model`, especially on
   cold start and when spawning subagents.
-- **Two independent, optional fallbacks** (both off unless configured):
-  - *local saturated → cloud*: if N local requests stall past a threshold, divert to an
-    Anthropic model. Gated on real remaining quota, read from a status endpoint you supply
-    (`CLAUDE_ROUTER_PANEL_URL`). **No endpoint, no diversion** — it fails closed, so it
-    can never quietly burn quota you don't have.
-  - *cloud quota exhausted → local*: when Anthropic answers "out of quota" for a matching
-    model, retry locally and open a short breaker. Driven by the actual API response, not a
-    clock.
+- **One deliberate door to Anthropic, and no automatic one.** A request whose model is
+  local is checked against the dashboard's routing config
+  (`CLAUDE_ROUTER_ROUTING_CONFIG_URL`); if the operator pinned that session's plan to
+  `claude`, it goes to Anthropic as `CLAUDE_ROUTER_CLAUDE_PLAN_MODEL`. Unreachable config,
+  stale config, or no `sticky`+`default_plan` → it stays local. Every diversion is logged
+  per request.
+  - The two automatic diversions this file used to document — *local saturated → cloud*
+    and *cloud quota exhausted → local* — were **removed on 17-09-2026** with the code
+    behind them. Local saturation is handled by admission control inside LiteLLM, not by a
+    proxy guessing at latency, and a silent jump to a paid model is exactly what nobody
+    wanted. `CLAUDE_ROUTER_PANEL_URL`, `CLAUDE_ROUTER_QUOTA_*`,
+    `CLAUDE_ROUTER_FALLBACK_*` and `CLAUDE_ROUTER_CLOUD_FALLBACK_*` are no longer read.
 - **A history guardrail.** Some gateways emit keys (`provider_specific_fields`) that
   Anthropic rejects once they're in the transcript, which poisons the *whole conversation*
   from that point on. `CLAUDE_ROUTER_MIXED=strip` (the default) removes them in flight.
-- **`GET /-/health`** with live counters, the active config and *why* a fallback is
-  currently allowed or blocked — so a disabled diversion is visible immediately instead of
+- **`GET /-/health`** with live counters, the active config and *why* the claude door is
+  currently open or shut — so a diversion nobody asked for is visible immediately instead of
   at the next outage.
 - `SIGHUP` reloads the gateway URL/key without dropping the listener.
 
-## The plugin owns the router
+## The plugin owns the router; `proxy-claude` owns its source
 
-The router and the Claude Code plugin are one artifact. **The plugin is the only thing that
-deploys the router** — there is no separate router install:
+Two copies of `claude-router.js` existed and drifted: this bundle froze at the commit that
+introduced it, while the router kept being fixed in
+[`pocharlies-org/proxy-claude`](https://github.com/pocharlies-org/proxy-claude). Because the
+`SessionStart` hook below deploys the *bundled* bytes, every new Claude Code session quietly
+reverted the router to the stale copy — on 2026-09-21 that took four chat profiles out of
+`/v1/models` and re-enabled a paid-model diversion that had been retired four days earlier.
+
+So the split is explicit now:
+
+- **`proxy-claude/bin/claude-router.js` is the source of truth.** Router changes go there.
+- **This repo is the distributor.** The bundle is a byte-for-byte copy of it, and
+  `.github/workflows/bundle-drift.yml` fails any PR where the two differ.
+- If you only have this repo, the bundle still installs and works — it is just a snapshot,
+  and the CI gate is what keeps the snapshot honest.
+
+The router and the Claude Code plugin are one deployable artifact. **The plugin is the only
+thing that deploys the router** — there is no separate router install:
 
 - The router binary ships **inside** the plugin (`plugins/local-router/bin/claude-router.js`).
 - A **`SessionStart` hook** runs `scripts/deploy.sh` on every session. It is a fast no-op
@@ -115,20 +134,22 @@ export ANTHROPIC_AUTH_TOKEN="sk-..."                           # a key scoped to
 ```
 
 Service-level knobs go in the unit/plist — see the header of
-[`bin/claude-router.js`](bin/claude-router.js), which documents all 16 with their defaults.
-The ones you are most likely to touch:
+[`plugins/local-router/bin/claude-router.js`](plugins/local-router/bin/claude-router.js),
+which documents all 12 with their defaults. The ones you are most likely to touch:
 
 | variable | default | meaning |
 |---|---|---|
 | `CLAUDE_ROUTER_PORT` | `18791` | listen port, `127.0.0.1` only |
-| `CLAUDE_ROUTER_LOCAL_RE` | `^(qwen\|tooling\|or-\|litellm/)` | which models are "local" |
-| `CLAUDE_ROUTER_MODELS` | `qwen38-flash-next,qwen38-flash-next-uncensored` | what `/v1/models` advertises |
-| `CLAUDE_ROUTER_FALLBACK_MODEL` | `claude-opus-5` | local-saturated diversion; `off` to disable |
-| `CLAUDE_ROUTER_CLOUD_FALLBACK_MODEL` | *(empty = off)* | local model to use when cloud quota runs out |
+| `CLAUDE_ROUTER_LOCAL_RE` | `^(qwen\|tooling\|or-\|alibaba-\|q38-\|litellm/)` | which models are "local" |
+| `CLAUDE_ROUTER_MODELS` | the 9 aliases deployed on the x86 | what `/v1/models` advertises |
+| `CLAUDE_ROUTER_ROUTING_CONFIG_URL` | `http://10.43.80.147:9002/api/model-routing/config` | dashboard routing config, read only on the `LOCAL_RE` branch |
+| `CLAUDE_ROUTER_CLAUDE_PLAN_MODEL` | `claude-opus-5` | where a session the dashboard marked `plan=claude` goes |
 
-> **Set `CLAUDE_ROUTER_FALLBACK_MODEL=off` unless you actually run a quota endpoint.**
-> Without one the gate fails closed anyway, but `off` states the intent and keeps
-> `/-/health` honest.
+> **There is no automatic diversion to Anthropic.** The `CLAUDE_ROUTER_FALLBACK_MODEL`
+> (local-saturated) and `CLAUDE_ROUTER_CLOUD_FALLBACK_MODEL` (quota) knobs were removed
+> on 17-09-2026 along with the code behind them: saturation is handled by admission
+> control inside LiteLLM, and a session reaches Opus only when the operator says so in
+> the dashboard. Setting those variables now does nothing.
 
 ## Commands
 
@@ -136,7 +157,7 @@ Namespaced by plugin. From a shell: `claude -p "/local-router:status"`.
 
 - **`/local-router:install`** — deploy/redeploy the router from the plugin's bundled binary
   (`deploy.sh --force`). The only way the router gets placed.
-- **`/local-router:status`** — explain `/-/health`: routing, traffic, both fallbacks
+- **`/local-router:status`** — explain `/-/health`: routing, traffic, and the state of the claude door
   (including *why* one is blocked), and stall pressure.
 - **`/local-router:reload`** — re-read the gateway URL/key on `SIGHUP` without dropping
   in-flight streams.

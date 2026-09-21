@@ -9,180 +9,76 @@
 //
 // Solo escucha en 127.0.0.1. Sin dependencias. Config por entorno:
 //   CLAUDE_ROUTER_PORT       (18791)
-//   CLAUDE_ROUTER_LOCAL_RE   ('^(qwen|tooling|or-|litellm/)', case-insensitive)
+//   CLAUDE_ROUTER_LOCAL_RE   ('^(qwen|tooling|or-|alibaba-|q38-|litellm/)', case-insensitive)
+//                            `q38-` son los cuatro perfiles de chat (OWU-50):
+//                            q38-flash, q38-flash-think, q38-flash-u, q38-flash-u-think.
+//                            Sin rama en esta regex, esos nombres se van a Anthropic
+//                            y el CLI corta con 404 (medido el 21-09).
+//   CLAUDE_ROUTER_MODELS     lista de /v1/models (default: el set desplegado en el x86,
+//                            ver systemd/claude-router.service)
 //   CLAUDE_ROUTER_ENV_FILE   (~/.config/claude-local/env: export ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN)
 //   CLAUDE_ROUTER_MIXED      ('strip') strip | block | off  -- guardrail historial local -> Anthropic
 //                            strip: borra las claves prohibidas del payload y reenvia igual
 //                            block: (comportamiento viejo) corta con 400 y manda a la skill de limpieza
 //                            off:   no toca nada, reenvia el bloque envenenado tal cual (para depurar)
 //   CLAUDE_ROUTER_BAD_KEYS   ('provider_specific_fields') claves prohibidas, separadas por comas
-//   CLAUDE_ROUTER_CLOUD_FALLBACK_MODEL ('' = off) modelo LOCAL al que desviar cuando la CUOTA de
-//                                   Anthropic se agota (decide la respuesta de Anthropic, no un reloj).
-//   CLAUDE_ROUTER_CLOUD_FALLBACK_RE   ('^claude-fable') que modelos de Anthropic son divertibles.
-//   CLAUDE_ROUTER_CLOUD_COOLDOWN_S    (300) segundos de breaker tras un error de cuota: durante el
-//                                   breaker los divertibles van directos a local sin pagar el error.
 //   CLAUDE_ROUTER_ANTHROPIC_URL       (https://api.anthropic.com) destino Anthropic (test).
-//   CLAUDE_ROUTER_FALLBACK_MODEL    ('claude-opus-5') modelo de Anthropic al que desviar cuando el
-//                                   backend local esta saturado DE VERDAD. 'off' (o vacio) lo desactiva.
-//   CLAUDE_ROUTER_FALLBACK_BETA     ('context-1m-2025-08-07') betas que se anaden al desviar
-//   CLAUDE_ROUTER_FALLBACK_SLOW_MS  (180000) una peticion local cuenta como ATASCADA a partir de aqui
-//   CLAUDE_ROUTER_FALLBACK_STALLED  (3) cuantas atascadas a la vez disparan el desvio
-//   CLAUDE_ROUTER_PANEL_URL         (http://127.0.0.1:8799/v1/accounts) reloj UNICO de cuota del host
-//   CLAUDE_ROUTER_QUOTA_EMAIL       (oauthAccount de ~/.claude.json) cuenta cuya cuota manda
-//   CLAUDE_ROUTER_FALLBACK_MAX_UTIL (0.9) si la ventana de 5h o la de 7d pasa de eso, NO se desvia
-//   CLAUDE_ROUTER_QUOTA_STALE_MS    (1500000 = 25 min, el mismo umbral del panel) lectura vieja = NO desviar
+//   CLAUDE_ROUTER_ROUTING_CONFIG_URL  (http://10.43.80.147:9002/api/model-routing/config)
+//                            INFRA-208: config del panel de routing del dashboard. El router
+//                            la consulta SOLO en la rama LOCAL_RE y SOLO para la puerta
+//                            claude (plan de la sesion = claude -> Anthropic passthrough).
+//                            Local-vs-Alibaba NO es competencia del router: eso lo decide el
+//                            hook session_router.py dentro de LiteLLM (frontera del mandato 8).
+//   CLAUDE_ROUTER_ROUTING_CONFIG_TTL_MS (60000) cache de esa config (patron quotaGate);
+//                            inalcanzable/vieja => NO se desvia (fail-safe = comportamiento actual).
+//   CLAUDE_ROUTER_CLAUDE_PLAN_MODEL   ('claude-opus-5') modelo Anthropic del desvio plan=claude.
+//   CLAUDE_ROUTER_CLAUDE_PLAN_BETA    ('context-1m-2025-08-07'; 'off' lo quita) beta anadida al
+//                            desviar: las sesiones locales corren con ventana de 262144 que no
+//                            cabe en los 200k estandar.
+//   CLAUDE_ROUTER_CLAUDE_PLAN_MAX_TOKENS (64000) tope de max_tokens al desviar (0 = no tocar):
+//                            el destino trae SU tope, no hereda el del modelo local (leccion
+//                            del desvio por cuota retirado el 17-09).
+// NO hay desvio automatico a ningun modelo de Anthropic por saturacion local: ver
+// "Por que ya no hay desvio a Opus" en el README. A Opus se va solo si lo elige el usuario.
+// La UNICA excepcion es la puerta claude de INFRA-208: no es automatica, es la voluntad
+// EXPLICITA del operador en el panel (plan de la sesion = claude), y se loguea por peticion.
 // SIGHUP recarga el fichero de entorno. GET /-/health devuelve contadores.
-const http = require('http'), https = require('https'), fs = require('fs'), os = require('os'), path = require('path'), zlib = require('zlib');
+const http = require('http'), https = require('https'), fs = require('fs'), os = require('os'), path = require('path');
 
 const PORT = Number(process.env.CLAUDE_ROUTER_PORT || 18791);
-const LOCAL_RE = new RegExp(process.env.CLAUDE_ROUTER_LOCAL_RE || '^(qwen|tooling|or-|litellm/)', 'i');
+const LOCAL_RE = new RegExp(process.env.CLAUDE_ROUTER_LOCAL_RE || '^(qwen|tooling|or-|alibaba-|q38-|litellm/)', 'i');
 const ENV_FILE = process.env.CLAUDE_ROUTER_ENV_FILE || path.join(os.homedir(), '.config', 'claude-local', 'env');
 const ANTHROPIC = new URL(process.env.CLAUDE_ROUTER_ANTHROPIC_URL || 'https://api.anthropic.com');
 
-// --- desvio a Anthropic cuando el backend local esta saturado -------------------
-// El 14-09-2026 dieciseis sesiones de Claude Code contra la UNICA instancia de
-// qwen38-flash-next dejaron la latencia en p50 98s / p90 306s / max 851s. El cliente se
-// cansa de esperar y el turno muere MUDO: el .jsonl acaba en un tool_result, sin mensaje
-// del asistente detras y sin ningun error grabado, y la sesion se queda parada. El router
-// lo ve antes que nadie, porque sabe cuantas peticiones locales tiene en vuelo y desde cuando.
+// --- NUNCA se desvia a Anthropic por saturacion local (17-09-2026) --------------------
+// Hubo un desvio automatico local -> claude-opus-5 (14-09) y va fuera: media mal y el
+// cliente no lo veia. Su senal era "cuantas peticiones locales llevan YA mas de SLOW_MS",
+// pero con streaming NINGUNA duracion separa "muerto" de "lento": medido el 17-09, las 10
+// peticiones que pasaron de 600s en 6h devolvieron TODAS 200, y la mas larga del dia tardo
+// 2089s (35 min) y acabo bien. El request_timeout:600 de LiteLLM NO corta un stream que
+// sigue soltando tokens, asi que el umbral caia dentro de la cola sana: 257 desvios en una
+// hora, gastando la suscripcion del usuario en peticiones que iban a salir. Y era peor de
+// lo que parecia: al desviar, el desvio MISMO descargaba el modelo local, asi que al
+// cerrarlo la cola crece y las atascadas suben solas -- se retroalimentaba.
 //
-// La senal es VIVA: cuantas peticiones locales llevan YA mas de SLOW_MS sin terminar. No se
-// usa la media de lo ya completado porque llega tarde -- una peticion de 9 minutos no aporta
-// su muestra hasta el minuto 9, cuando el dano ya esta hecho. Y se recupera sola: en cuanto
-// la cola drena, el contador baja y las peticiones vuelven al modelo local.
+// Queda solo lo que decide el usuario: si elige Opus en el picker, eso es passthrough y
+// funciona igual. Lo que NO se hace aqui es decidir por el, en silencio.
 //
-// El id de modelo es el de la API (`claude-opus-5`), NO el del CLI: `claude-opus-5[1m]` da
-// 404 not_found_error -- el sufijo `[1m]` es una convencion del cliente y la ventana de 1M se
-// pide por cabecera. Se anade al desviar porque las sesiones locales corren con
-// CLAUDE_CODE_MAX_CONTEXT_TOKENS=262144 (la ventana real de qwen38-flash-next), que NO cabe
-// en los 200k estandar de Opus. La credencial y el resto de cabeceras van intactas: es el
-// OAuth de la cuenta del usuario, el mismo con el que ya habla el passthrough.
-const FALLBACK_MODEL = (() => {
-  const v = process.env.CLAUDE_ROUTER_FALLBACK_MODEL ?? 'claude-opus-5';
-  return /^(off|no|0)$/i.test(v.trim()) ? '' : v.trim();
-})();
-const FALLBACK_BETA = (process.env.CLAUDE_ROUTER_FALLBACK_BETA ?? 'context-1m-2025-08-07')
-  .split(',').map((x) => x.trim()).filter(Boolean);
-const FALLBACK_SLOW_MS = Number(process.env.CLAUDE_ROUTER_FALLBACK_SLOW_MS || 180000);
-const FALLBACK_STALLED = Number(process.env.CLAUDE_ROUTER_FALLBACK_STALLED || 3);
-const localInFlight = new Set(); // una entrada { t0 } por peticion local viva
+// Si algun dia se vuelve a mirar la saturacion, la senal que si significa "timeout" es el
+// TIEMPO SIN RECIBIR UN BYTE (entry.last en cada chunk), no el tiempo desde que empezo.
 
-// --- desvio a LOCAL cuando la CUOTA de Anthropic se agota (15-09-2026) ----------------
-// El planificador de la compania (tech-lead) va pinneado a claude-fable-5-1, pero la cuota
-// semanal de la cuenta se agota y el turno moria con el limite a la vista. El CEO pidio: cada
-// spawn INTENTA fable y SOLO cae a qwen38-flash-next si no queda cuota. Aqui no decide un reloj
-// (el del panel envejece horas, y el gate local->Opus de abajo se apaga cuando no lo ve fresco):
-// decide la RESPUESTA de Anthropic. Se pasa tal cual; si el error es de CUOTA (no overload: un
-// 529 sigue siendo error visible, no se enmascara) se reintenta la MISMA peticion contra LiteLLM
-// y el breaker abre COOLDOWN_S para no pagar el error en cada turno. Al vencer se sonda otra vez:
-// cuando la cuota vuelve, el modelo vuelve solo. No hace falta el gate de gasto de abajo: el
-// destino es el backend local, gratis; el riesgo es de calidad, no de bolsillo.
-const CLOUD_FALLBACK_MODEL = (() => {
-  const v = (process.env.CLAUDE_ROUTER_CLOUD_FALLBACK_MODEL || '').trim();
-  return /^(off|no|0)$/i.test(v) ? '' : v;
-})();
-const CLOUD_FALLBACK_RE = new RegExp(process.env.CLAUDE_ROUTER_CLOUD_FALLBACK_RE || '^claude-fable', 'i');
-const CLOUD_COOLDOWN_MS = Number(process.env.CLAUDE_ROUTER_CLOUD_COOLDOWN_S || 300) * 1000;
-const cloudBreaker = { until: 0, reason: '' };
-
-// Un 4xx con forma de CUOTA. Deliberadamente NO entra el 529 overloaded_error (caida
-// transitoria: enmascararla con el local ocultaria que Anthropic esta mal) ni un 400 de
-// payload (no es cuota, reintentarlo contra local daria el mismo 400). Casa los tres
-// spellings medidos en el panel del host: usage_limit_reached, "hit your weekly/session
-// limit" y rate_limit_error con el texto del limite.
-function isQuotaError(status, text) {
-  if (status < 400 || status > 499) return false;
-  return /usage_limit|hit your (weekly|session|daily) limit|out of (extra )?usage|rate_limit_error/i.test(text);
-}
-
-function stalledLocal() {
-  const now = Date.now();
-  let n = 0;
-  for (const e of localInFlight) if (now - e.t0 >= FALLBACK_SLOW_MS) n++;
-  return n;
-}
-
-// --- gate de cuota: solo se desvia si QUEDA cuota ---------------------------------
-// El desvio gasta la suscripcion de Anthropic y el cliente NO lo ve: VS Code sigue
-// anunciando qwen38 porque el router reescribe `model` cuando el CLI ya decidio. El
-// 14-09 salto 129 veces en 24 h y 37 de esas peticiones ni siquiera sirvieron (28x400,
-// 18x429, 2x401). Decide sobre el RELOJ UNICO de cuota del host: el panel :8799
-// (plugin opencode-claude), que es el unico que pregunta a Anthropic y lo hace en
-// temporizador. Preguntar aqui a /api/oauth/usage seria montar el SEGUNDO reloj de la
-// maquina, y el segundo reloj es lo que produce los 429 (regla del operador, 11-09-2026).
+// --- NO hay desvio a LOCAL por cuota: retirado el 17-09-2026 --------------------------
+// Lo hubo (15-09): fable -> qwen38-flash-next cuando el reloj del panel decia que quedaba
+// poca cuota. Fuera, por la misma razon que el desvio a Opus: decidia en silencio y el
+// cliente no lo veia. Y ademas rompia el turno -- reescribia `model` pero NO `max_tokens`,
+// asi que la peticion llegaba al modelo local (262144 de ventana) pidiendo los 64000 de
+// salida de fable: el prompt utilizable se quedaba en 198144 y toda sesion por encima moria
+// con un 400 ContextWindowExceeded. En bucle, porque el reintento manda el mismo prompt y el
+// CLI no compacta hasta los 250k que cree tener; y cambiar de modelo en el picker tampoco la
+// salvaba, porque el desvio ocurria DESPUES, aqui. Sesion tapiada sin salida desde dentro.
 //
-// Fail-closed: sin panel, sin fila para este login, sin numero, o con la lectura vieja
-// -> NO se desvia. La cuota es dinero; gastar sin saber hace mas daño que no desviar,
-// que solo devuelve el comportamiento de antes de existir el fallback.
-const PANEL_URL = process.env.CLAUDE_ROUTER_PANEL_URL || 'http://127.0.0.1:8799/v1/accounts';
-const FALLBACK_MAX_UTIL = Number(process.env.CLAUDE_ROUTER_FALLBACK_MAX_UTIL || 0.9);
-const QUOTA_STALE_MS = Number(process.env.CLAUDE_ROUTER_QUOTA_STALE_MS || 25 * 60 * 1000); // el del panel
-const QUOTA_TTL_S = 60, QUOTA_TTL_ERROR_S = 600;   // reintentar al minuto tras un error ES el 429
-
-// La cuenta que manda es la del login de ~/.claude, porque la credencial que viaja en el
-// desvio es la del cliente. El panel empareja por LOGIN y no por config dir: ~/.claude no
-// esta en su registro, pero su cuenta si, montada en otro dir (mismo criterio que
-// claude-rc-status.py).
-function hostEmail() {
-  if (process.env.CLAUDE_ROUTER_QUOTA_EMAIL) return process.env.CLAUDE_ROUTER_QUOTA_EMAIL.trim().toLowerCase();
-  try {
-    const j = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8'));
-    return String((j.oauthAccount || {}).emailAddress || '').trim().toLowerCase();
-  } catch { return ''; }
-}
-const HOST_EMAIL = hostEmail();
-
-const quota = { ts: 0, allow: false, reason: 'sin consultar', detail: '', ttl: 0, inflight: null };
-
-function panelFetch() {
-  return new Promise((resolve, reject) => {
-    const rq = http.get(PANEL_URL, { timeout: 3000 }, (res) => {
-      if (res.statusCode !== 200) { res.resume(); return reject(new Error(`panel HTTP ${res.statusCode}`)); }
-      const ch = [];
-      res.on('data', (c) => ch.push(c));
-      res.on('end', () => { try { resolve(JSON.parse(Buffer.concat(ch).toString('utf8'))); } catch (e) { reject(e); } });
-      res.on('error', reject);
-    });
-    rq.on('timeout', () => rq.destroy(new Error('timeout 3s')));
-    rq.on('error', reject);
-  });
-}
-
-function evalQuota(panel) {
-  const rows = (panel && Array.isArray(panel.data)) ? panel.data : [];
-  if (!HOST_EMAIL) return { allow: false, reason: 'sin login local (~/.claude.json)' };
-  const row = rows.find((r) => String(((r || {}).identity || {}).email || '').toLowerCase() === HOST_EMAIL);
-  if (!row) return { allow: false, reason: `el panel no tiene fila para ${HOST_EMAIL}` };
-  const q = row.quota || {}, w = q.windows || {};
-  const u5 = (w.fiveHour || {}).utilization, u7 = (w.sevenDay || {}).utilization;
-  const pct = (x) => (typeof x === 'number' ? `${Math.round(x * 100)}%` : '?');
-  if (typeof u5 !== 'number' && typeof u7 !== 'number') return { allow: false, reason: 'el panel no da utilization' };
-  const age = typeof row.quotaDataAgeMs === 'number' ? row.quotaDataAgeMs
-            : (typeof q.fetchedAt === 'number' ? Date.now() - q.fetchedAt : Infinity);
-  const d = `5h=${pct(u5)} 7d=${pct(u7)} edad=${Math.round(age / 60000)}min`;
-  if (age > QUOTA_STALE_MS) return { allow: false, reason: `lectura vieja (${d}, tope ${Math.round(QUOTA_STALE_MS / 60000)}min)`, detail: d };
-  if (q.status === 'rejected' || (row.rateLimit || {}).limited) return { allow: false, reason: `cuota rechazada (${d})`, detail: d };
-  const maxU = Math.max(typeof u5 === 'number' ? u5 : 0, typeof u7 === 'number' ? u7 : 0);
-  if (maxU >= FALLBACK_MAX_UTIL) return { allow: false, reason: `sin margen: max=${Math.round(maxU * 100)}% >= ${Math.round(FALLBACK_MAX_UTIL * 100)}% (${d})`, detail: d };
-  return { allow: true, reason: `hay cuota (${d})`, detail: d };
-}
-
-function quotaGate() {
-  if (quota.ts && Date.now() - quota.ts < quota.ttl * 1000) return Promise.resolve(quota);
-  if (quota.inflight) return quota.inflight;
-  quota.inflight = panelFetch()
-    .then((panel) => {
-      const r = evalQuota(panel);
-      Object.assign(quota, { ts: Date.now(), allow: r.allow, reason: r.reason, detail: r.detail || '', ttl: QUOTA_TTL_S });
-      return quota;
-    })
-    .catch((e) => {
-      Object.assign(quota, { ts: Date.now(), allow: false, reason: `panel no contesta: ${e.message}`, ttl: QUOTA_TTL_ERROR_S });
-      return quota;
-    })
-    .finally(() => { quota.inflight = null; });
-  return quota.inflight;
-}
+// Si vuelve a hacer falta desviar por cuota, el destino tiene que traer SU ventana y SU tope
+// de salida, no heredar los del modelo de origen.
 
 function log(s) { process.stdout.write(`${new Date().toISOString()} ${s}\n`); }
 
@@ -199,7 +95,60 @@ let LITELLM = loadLiteLLM();
 process.on('SIGHUP', () => { try { LITELLM = loadLiteLLM(); log(`reload ok litellm=${LITELLM.url.host}`); } catch (e) { log(`reload ERROR ${e.message}`); } });
 
 const agents = { 'https:': new https.Agent({ keepAlive: true }), 'http:': new http.Agent({ keepAlive: true }) };
-const stats = { started: new Date().toISOString(), anthropic: 0, litellm: 0, errors: 0, blocked: 0, cleaned: 0, models: 0, fallbacks: 0, fallback_blocked: 0, cloud_fallbacks: 0 };
+const stats = { started: new Date().toISOString(), anthropic: 0, litellm: 0, errors: 0, blocked: 0, cleaned: 0, models: 0, plan_claude: 0 };
+
+// --- puerta claude (INFRA-208 PR 4/4) ------------------------------------------------
+// El router decide claude-vs-litellm; el hook de LiteLLM decide local-vs-alibaba. Aqui
+// SOLO se consulta el plan de la sesion cuando el modelo pedido es LOCAL: opus/fable son
+// passthrough y nunca consultan el mapa (mandato 8 del arquitecto). Plan = claude =>
+// Anthropic con el modelo del plan (la sesion local pide qwen38-flash-next, que Anthropic
+// no conoce: hay que reescribir el modelo, meter la beta de ventana y topar max_tokens —
+// el destino trae SU ventana y SU tope, leccion del desvio por cuota retirado el 17-09).
+// Fail-safe: config inalcanzable o vieja => null => sin desvio, comportamiento actual.
+const ROUTING_CONFIG_URL = process.env.CLAUDE_ROUTER_ROUTING_CONFIG_URL
+  || 'http://10.43.80.147:9002/api/model-routing/config';
+const ROUTING_CONFIG_TTL_MS = Number(process.env.CLAUDE_ROUTER_ROUTING_CONFIG_TTL_MS || 60000);
+const PLAN_MODEL = process.env.CLAUDE_ROUTER_CLAUDE_PLAN_MODEL || 'claude-opus-5';
+const PLAN_BETA = (() => {
+  const v = process.env.CLAUDE_ROUTER_CLAUDE_PLAN_BETA ?? 'context-1m-2025-08-07';
+  return /^(off|no|0)$/i.test(v.trim()) ? '' : v.trim();
+})();
+const PLAN_MAX_TOKENS = Number(process.env.CLAUDE_ROUTER_CLAUDE_PLAN_MAX_TOKENS ?? 64000);
+
+const routingCache = { cfg: null, expires: 0, inflight: null };
+function routingConfig() {
+  const now = Date.now();
+  if (now < routingCache.expires) return Promise.resolve(routingCache.cfg);
+  if (routingCache.inflight) return routingCache.inflight; // single-flight
+  routingCache.inflight = new Promise((resolve) => {
+    const done = (cfg) => {
+      routingCache.cfg = cfg;
+      routingCache.expires = Date.now() + ROUTING_CONFIG_TTL_MS;
+      routingCache.inflight = null;
+      resolve(cfg);
+    };
+    const rq = http.get(ROUTING_CONFIG_URL, { timeout: 2000 }, (r) => {
+      let buf = '';
+      r.setEncoding('utf8');
+      r.on('data', (c) => { buf += c; if (buf.length > 65536) r.destroy(); });
+      r.on('end', () => {
+        try { done(r.statusCode === 200 ? JSON.parse(buf) : null); } catch { done(null); }
+      });
+    });
+    rq.on('timeout', () => rq.destroy(new Error('timeout')));
+    rq.on('error', (e) => { log(`routing-config ERROR ${e.message}; fail-safe = sin desvio`); done(null); });
+  });
+  return routingCache.inflight;
+}
+function planIsClaude(cfg, sid) {
+  if (!cfg || typeof cfg !== 'object') return false;
+  const plans = (cfg.session_plans && typeof cfg.session_plans === 'object') ? cfg.session_plans : {};
+  // Entrada explicita de la sesion gana SIEMPRE (incluso para decir "no claude").
+  if (sid && Object.prototype.hasOwnProperty.call(plans, sid)) return plans[sid] === 'claude';
+  // Default solo con sticky activo: misma semantica que el hook de LiteLLM (los flags
+  // gobiernan los mecanismos automaticos; sin sticky, el default_plan no aplica).
+  return cfg.sticky === true && cfg.default_plan === 'claude';
+}
 
 // --- guardrail: historial del modelo LOCAL hacia Anthropic ----------------------
 // Los tool_use que emite LiteLLM (capa OpenAI-compat) llevan claves extra que la API de
@@ -267,12 +216,8 @@ function fail(res, status, msg) {
   res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: `claude-router: ${msg}` } }));
 }
 
-function forward(req, res, target, headers, body, tag, track) {
+function forward(req, res, target, headers, body, tag) {
   const t0 = Date.now();
-  const entry = track ? { t0 } : null;
-  if (entry) localInFlight.add(entry);
-  let done = false;
-  const finish = () => { if (!done) { done = true; if (entry) localInFlight.delete(entry); } };
   const mod = target.protocol === 'https:' ? https : http;
   const up = mod.request({
     protocol: target.protocol, hostname: target.hostname, port: target.port || undefined, agent: agents[target.protocol],
@@ -280,11 +225,12 @@ function forward(req, res, target, headers, body, tag, track) {
   }, (ur) => {
     res.writeHead(ur.statusCode, ur.headers);
     ur.pipe(res);
-    ur.on('end', () => { finish(); log(`${tag} ${ur.statusCode} ${Date.now() - t0}ms ${req.method} ${req.url}`); });
-    ur.on('error', finish); // respuesta cortada a medias: no dejar la entrada colgada como "atascada"
+    ur.on('end', () => log(`${tag} ${ur.statusCode} ${Date.now() - t0}ms ${req.method} ${req.url}`));
+    // Un stream cortado a medias emite 'error': sin oyente eso es un proceso muerto.
+    ur.on('error', (e) => log(`${tag} ERROR stream ${e.message}`));
   });
-  up.on('error', (e) => { finish(); log(`${tag} ERROR ${e.code || ''} ${e.message}`); fail(res, 502, `${target.host}: ${e.message}`); });
-  res.on('close', () => { if (!res.writableFinished) { finish(); up.destroy(); } }); // el cliente se fue: cancela arriba
+  up.on('error', (e) => { log(`${tag} ERROR ${e.code || ''} ${e.message}`); fail(res, 502, `${target.host}: ${e.message}`); });
+  res.on('close', () => { if (!res.writableFinished) up.destroy(); }); // el cliente se fue: cancela arriba
   if (body !== undefined) up.end(body); else req.pipe(up);
 }
 
@@ -293,75 +239,24 @@ function forward(req, res, target, headers, body, tag, track) {
 // `onQuota` reintenta contra el otro backend. Un 2xx (incluido el SSE del stream) va tal
 // cual, sin buffer. Solo se usa en el camino Anthropic->divertible; el resto del trafico
 // sigue por `forward`, que no toca el stream.
-function forwardSniffQuota(req, res, target, headers, body, tag, onQuota) {
-  const t0 = Date.now();
-  const mod = target.protocol === 'https:' ? https : http;
-  const up = mod.request({
-    protocol: target.protocol, hostname: target.hostname, port: target.port || undefined, agent: agents[target.protocol],
-    method: req.method, path: req.url, headers: { ...headers, host: target.host },
-  }, (ur) => {
-    if (ur.statusCode < 400) {
-      res.writeHead(ur.statusCode, ur.headers);
-      ur.pipe(res);
-      ur.on('end', () => log(`${tag} ${ur.statusCode} ${Date.now() - t0}ms ${req.method} ${req.url}`));
-      ur.on('error', () => {}); // stream cortado: el cliente ya tiene cabeceras
-      return;
-    }
-    const ch = [];
-    ur.on('data', (c) => ch.push(c));
-    ur.on('end', () => {
-      const raw = Buffer.concat(ch);
-      // El cuerpo de error llega COMPRIMIDO (br/gzip — medido 15-09: el sniff en crudo no
-      // casaba el regex y el 429 de cuota se reenviaba tal cual). Se descomprime SOLO para
-      // la decision; al cliente se le reenvian los bytes originales con sus cabeceras.
-      let text = '';
-      const enc = String(ur.headers['content-encoding'] || '').toLowerCase();
-      try {
-        if (enc.includes('br')) text = zlib.brotliDecompressSync(raw).toString('utf8');
-        else if (enc.includes('gzip')) text = zlib.gunzipSync(raw).toString('utf8');
-        else if (enc.includes('deflate')) text = zlib.inflateSync(raw).toString('utf8');
-        else text = raw.toString('utf8');
-      } catch { text = ''; } // no decodea o pasa de 64 KiB: no se reclama, se reenvia igual
-      // El tope de 64 KiB limita la DECISION (un error de cuota es JSON de cientos de bytes),
-      // nunca el reenvio: los bytes originales salen siempre intactos.
-      if (raw.length <= 65536 && text && onQuota(ur.statusCode, text)) {
-        log(`${tag} ${ur.statusCode} ${Date.now() - t0}ms ${req.method} ${req.url} -> reintentado en LOCAL (cuota)`);
-        return; // onQuota ya escribio en `res`
-      }
-      res.writeHead(ur.statusCode, ur.headers);
-      res.end(raw);
-      log(`${tag} ${ur.statusCode} ${Date.now() - t0}ms ${req.method} ${req.url}`);
-    });
-    ur.on('error', () => fail(res, 502, `${target.host}: upstream error`));
-  });
-  up.on('error', (e) => fail(res, 502, `${target.host}: ${e.message}`));
-  res.on('close', () => { if (!res.writableFinished) up.destroy(); });
-  if (body !== undefined) up.end(body); else up.end();
-}
-
 const server = http.createServer((req, res) => {
   if (req.url === '/-/health') {
-    // El gate se consulta AQUI, no solo al desviar: el problema no era solo gastar cuota,
-    // era gastarla sin que nadie lo viera. Sin esto habria que esperar a una saturacion
-    // para saber por que el desvio esta apagado.
-    return quotaGate().then((q) => {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, port: PORT, gateway: LITELLM.url.host, local_re: LOCAL_RE.source, mixed: MIXED, bad_keys: BAD_KEYS,
-        fallback_model: FALLBACK_MODEL || 'off', fallback_beta: FALLBACK_BETA, fallback_slow_ms: FALLBACK_SLOW_MS, fallback_stalled: FALLBACK_STALLED,
-        fallback_allowed: q.allow, fallback_reason: q.reason, fallback_quota: q.detail || null,
-        cloud_fallback_model: CLOUD_FALLBACK_MODEL || 'off', cloud_fallback_re: CLOUD_FALLBACK_RE.source,
-        cloud_breaker_until: cloudBreaker.until ? new Date(cloudBreaker.until).toISOString() : null,
-        cloud_breaker_reason: cloudBreaker.reason || null,
-        quota_email: HOST_EMAIL || null, quota_panel: PANEL_URL,
-        local_inflight: localInFlight.size, local_stalled: stalledLocal(), ...stats }));
-    }).catch(() => fail(res, 500, 'health'));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, port: PORT, litellm: LITELLM.url.host, local_re: LOCAL_RE.source,
+      mixed: MIXED, bad_keys: BAD_KEYS, ...stats }));
   }
   // GET /v1/models: el CLI de Claude valida --model contra esta lista (arranque frio y
   // subagentes la vuelven a pedir). Sin handler cae en el passthrough a api.anthropic.com,
   // que no lista los modelos locales -> el CLI corta con "unrecognized_model qwen38-flash-next"
   // de forma intermitente. Servimos aqui los modelos locales (CLAUDE_ROUTER_MODELS).
   if (req.method === 'GET' && /^\/v1\/models(\?|$)/.test(req.url)) {
-    const ids = (process.env.CLAUDE_ROUTER_MODELS || 'qwen38-flash-next,qwen38-flash-next-uncensored')
+    const ids = (process.env.CLAUDE_ROUTER_MODELS
+      // Default = el set que la unidad systemd del x86 ya pinneaba por entorno
+      // (drift reconciliado, INFRA-208): instalar desde main reproduce lo desplegado
+      // sin depender del env de la unidad. Los cuatro `q38-flash*` son los perfiles
+      // de chat de OWU-50 (los mismos que ve Open WebUI).
+      || 'qwen38-flash-next,qwen38-flash-next-uncensored,tooling,alibaba-q38-flash,alibaba-q38-max,'
+        + 'q38-flash,q38-flash-think,q38-flash-u,q38-flash-u-think')
       .split(',').map((s) => s.trim()).filter(Boolean);
     const data = ids.map((id) => ({ type: 'model', id, display_name: id, created_at: '2026-01-01T00:00:00Z' }));
     stats.models++;
@@ -382,88 +277,70 @@ const server = http.createServer((req, res) => {
     try { payload = JSON.parse(body.toString('utf8')); } catch {} // no parsea: se reenvia tal cual
     const model = (payload && payload.model) || '?';
     const h = { ...req.headers }; delete h.host; delete h['transfer-encoding']; h['content-length'] = String(body.length);
+    // Camino Anthropic: passthrough OAuth + guardrail MIXED (strip/block del
+    // historial local envenenado). Tambien lo usa la puerta claude de INFRA-208.
+    const sendAnthropic = (hdrs, inBody, tag) => {
+      let outBody = inBody;
+      if (MIXED === 'block' && payload) {
+        const hits = scanLocalArtifacts(payload, false);
+        if (hits.length) {
+          log(`BLOQUEADO model=${model} ${req.url} historial-local ${hits.length} bloque(s): ${hits[0]}`);
+          return blockMixed(res, model, hits);
+        }
+      } else if (MIXED === 'strip' && payload) {
+        const hits = scanLocalArtifacts(payload, true);
+        if (hits.length) {
+          stats.cleaned++;
+          // payload ya lleva los cambios del desvio (si los hubo); re-serializar
+          // aqui mantiene strip + desvio en el MISMO body.
+          outBody = Buffer.from(JSON.stringify(payload));
+          hdrs['content-length'] = String(outBody.length);
+          log(`LIMPIADO model=${model} ${req.url} historial-local ${hits.length}+ bloque(s): ${hits[0]}`);
+        }
+      }
+      stats.anthropic++;
+      return forward(req, res, ANTHROPIC, hdrs, outBody, tag);
+    };
+    const sendLocal = () => {
+      // Local es local, siempre. Si el modelo local esta saturado el turno tarda o se queda
+      // mudo, y eso es VISIBLE: es el problema real, y taparlo con la suscripcion del usuario
+      // era el desvio que va fuera (ver arriba). count_tokens tampoco se toca.
+      delete h['x-api-key']; delete h.authorization;
+      h.authorization = `Bearer ${LITELLM.key}`;
+      stats.litellm++;
+      return forward(req, res, LITELLM.url, h, body, `LITELLM  model=${model}`);
+    };
+    // Puerta claude (INFRA-208): solo en la rama LOCAL_RE, solo claude-vs-litellm.
+    // Local-vs-alibaba lo decide el hook session_router.py dentro de LiteLLM; el
+    // router NUNCA reescribe entre ellos (frontera del mandato 8 del arquitecto).
+    // Fail-safe: sin config o error => sendLocal() = comportamiento actual.
     if (LOCAL_RE.test(model)) {
-      // count_tokens NO se desvia: es barato, no hace cola, y Anthropic no conoce el modelo local.
-      const divertible = Boolean(FALLBACK_MODEL) && payload !== null && !/count_tokens/.test(req.url);
-      const stalled = divertible ? stalledLocal() : 0;
-      const toLiteLLM = () => {
-        delete h['x-api-key']; delete h.authorization;
-        h.authorization = `Bearer ${LITELLM.key}`;
-        stats.litellm++;
-        return forward(req, res, LITELLM.url, h, body, `LITELLM  model=${model}`, true);
-      };
-      if (divertible && stalled >= FALLBACK_STALLED) {
-        // Antes de gastar hay que tener cuota: el desvio paga la suscripcion del usuario y
-        // el cliente no se entera (ver el gate de cuota mas arriba).
-        return quotaGate().then((g) => {
-          if (!g.allow) {
-            stats.fallback_blocked++;
-            log(`FALLBACK-SIN-CUOTA model=${model} saturacion=${stalled} NO se desvia (${g.reason}) -> sigue LOCAL`);
-            return toLiteLLM();
-          }
-          // El strip es OBLIGATORIO aqui, pase lo que pase con MIXED: el historial que arrastra la
-          // sesion lo escribio el modelo local y Anthropic lo rechaza con 400 "Extra inputs are not
-          // permitted" (ver el guardrail de arriba). Sin esto el desvio falla siempre.
-          const hits = scanLocalArtifacts(payload, true);
-          const original = payload.model;
-          payload.model = FALLBACK_MODEL;
-          const outBody = Buffer.from(JSON.stringify(payload));
-          h['content-length'] = String(outBody.length); // credencial del cliente INTACTA: es la cuenta del usuario
-          const betas = (h['anthropic-beta'] || '').split(',').map((x) => x.trim()).filter(Boolean);
-          for (const b of FALLBACK_BETA) if (!betas.includes(b)) betas.push(b);
-          if (betas.length) h['anthropic-beta'] = betas.join(',');
-          stats.fallbacks++; stats.anthropic++;
-          if (hits.length) stats.cleaned++;
-          log(`FALLBACK model=${original} -> ${FALLBACK_MODEL} saturacion=${stalled} atascadas >${Math.round(FALLBACK_SLOW_MS / 1000)}s ` +
-              `de ${localInFlight.size} en vuelo cuota="${g.reason}"${hits.length ? ` limpiados ${hits.length}+ bloque(s)` : ''}`);
-          return forward(req, res, ANTHROPIC, h, outBody, `ANTHROPIC(fallback) model=${FALLBACK_MODEL}`);
-        });
-      }
-      return toLiteLLM();
+      const sid = req.headers['x-claude-code-session-id'] || req.headers['x-litellm-session-id'] || '';
+      if (!payload) return sendLocal(); // body ilegible: no hay desvio posible
+      return routingConfig().then((cfg) => {
+        if (!planIsClaude(cfg, sid)) return sendLocal();
+        stats.plan_claude++;
+        // La sesion local pide un alias que Anthropic no conoce: el desvio trae
+        // SU modelo, SU ventana (beta) y SU tope de salida. OAuth se conserva
+        // (los headers de la peticion YA son los de Anthropic; sendLocal los
+        // cambiaria por la key de LiteLLM — aqui no se toca nada de eso).
+        payload.model = PLAN_MODEL;
+        if (PLAN_MAX_TOKENS && typeof payload.max_tokens === 'number'
+            && payload.max_tokens > PLAN_MAX_TOKENS) payload.max_tokens = PLAN_MAX_TOKENS;
+        const hdrs = { ...h };
+        if (PLAN_BETA && !(hdrs['anthropic-beta'] || '').includes(PLAN_BETA)) {
+          hdrs['anthropic-beta'] = hdrs['anthropic-beta']
+            ? `${hdrs['anthropic-beta']},${PLAN_BETA}` : PLAN_BETA;
+        }
+        const outBody = Buffer.from(JSON.stringify(payload));
+        hdrs['content-length'] = String(outBody.length);
+        log(`PLAN-CLAUDE model=${model} -> ${PLAN_MODEL} sid=${sid || '-'}`);
+        // El historial local viaja igual a Anthropic: el desvio NO exime del
+        // guardrail MIXED (los tool_use envenenados siguen ahi).
+        return sendAnthropic(hdrs, outBody, `ANTHROPIC(plan=claude) model=${PLAN_MODEL}`);
+      }, () => sendLocal());
     }
-    let outBody = body;
-    if (MIXED === 'block' && payload) {
-      const hits = scanLocalArtifacts(payload, false);
-      if (hits.length) {
-        log(`BLOQUEADO model=${model} ${req.url} historial-local ${hits.length} bloque(s): ${hits[0]}`);
-        return blockMixed(res, model, hits);
-      }
-    } else if (MIXED === 'strip' && payload) {
-      const hits = scanLocalArtifacts(payload, true);
-      if (hits.length) {
-        stats.cleaned++;
-        outBody = Buffer.from(JSON.stringify(payload));
-        h['content-length'] = String(outBody.length);
-        log(`LIMPIADO model=${model} ${req.url} historial-local ${hits.length}+ bloque(s): ${hits[0]}`);
-      }
-    }
-    // --- Anthropic divertible: se pasa, y SOLO si la respuesta dice "cuota" se cae a local ---
-    // (ver el bloque CLOUD_FALLBACK arriba). count_tokens fuera: es barato y un error ahi no
-    // mata ningun turno. Con el breaker abierto no se paga ni el error: va directo a local.
-    if (CLOUD_FALLBACK_MODEL && payload !== null && CLOUD_FALLBACK_RE.test(model) && !/count_tokens/.test(req.url)) {
-      const toLocalQuota = (why) => {
-        const original = payload.model;
-        payload.model = CLOUD_FALLBACK_MODEL;
-        const out = Buffer.from(JSON.stringify(payload));
-        h['content-length'] = String(out.length);
-        delete h['x-api-key']; delete h.authorization; // la credencial del cliente no sale hacia LiteLLM
-        h.authorization = `Bearer ${LITELLM.key}`;
-        stats.litellm++; stats.cloud_fallbacks++;
-        log(`CLOUD-FALLBACK model=${original} -> ${CLOUD_FALLBACK_MODEL} (${why})`);
-        return forward(req, res, LITELLM.url, h, out, `LITELLM(cuota) model=${CLOUD_FALLBACK_MODEL}`);
-      };
-      if (Date.now() < cloudBreaker.until) return toLocalQuota(`breaker abierto, ${Math.ceil((cloudBreaker.until - Date.now()) / 1000)}s mas: ${cloudBreaker.reason}`);
-      return forwardSniffQuota(req, res, ANTHROPIC, h, outBody, `ANTHROPIC model=${model}`, (status, text) => {
-        if (!isQuotaError(status, text)) return false; // 400 de payload, 401, 529...: se reenvia tal cual
-        cloudBreaker.until = Date.now() + CLOUD_COOLDOWN_MS;
-        cloudBreaker.reason = `HTTP ${status}: ${text.slice(0, 140).replace(/\s+/g, ' ')}`;
-        log(`CUOTA-MUERTA model=${model}: breaker ${Math.round(CLOUD_COOLDOWN_MS / 1000)}s (${cloudBreaker.reason})`);
-        toLocalQuota(`cuota agotada (HTTP ${status})`);
-        return true;
-      });
-    }
-    stats.anthropic++;
-    return forward(req, res, ANTHROPIC, h, outBody, `ANTHROPIC model=${model}`);
+    return sendAnthropic(h, body, `ANTHROPIC model=${model}`);
   });
 });
 server.keepAliveTimeout = 75000; server.headersTimeout = 80000;

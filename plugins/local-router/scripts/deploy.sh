@@ -30,7 +30,14 @@ LABEL="com.e-dani.claude-router"
 UNIT="$HOME/.config/systemd/user/claude-router.service"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 PORT="${CLAUDE_ROUTER_PORT:-18791}"
-ROUTER_MODELS="${ROUTER_MODELS:-qwen38-flash-next,qwen38-flash-next-uncensored}"
+# Los valores por defecto son EL SET DESPLEGADO, no un recuerdo. Estan anclados a
+# proxy-claude/systemd/claude-router.service y un test de CI peta si divergen: aqui
+# hubo un default de dos modelos mientras el router publicaba nueve, y cada sesion
+# nueva se llevaba por delante los cuatro perfiles de chat de OWU-50.
+ROUTER_MODELS="${CLAUDE_ROUTER_MODELS:-${ROUTER_MODELS:-qwen38-flash-next,qwen38-flash-next-uncensored,tooling,alibaba-q38-flash,alibaba-q38-max,q38-flash,q38-flash-think,q38-flash-u,q38-flash-u-think}}"
+# LOCAL_RE decide que NO se va a Anthropic. Sin `q38-` en la regex, los cuatro
+# perfiles de chat pegan contra la API de Anthropic y el CLI corta con 404.
+ROUTER_LOCAL_RE="${CLAUDE_ROUTER_LOCAL_RE:-^(qwen|tooling|or-|alibaba-|q38-|litellm/)}"
 
 log() { printf '%s\n' "$*"; }
 die() { printf '! %s\n' "$*" >&2; exit 1; }
@@ -101,7 +108,7 @@ if [ "$SVC" = launchd ]; then
   <key>EnvironmentVariables</key><dict>
     <key>CLAUDE_ROUTER_PORT</key><string>$PORT</string>
     <key>CLAUDE_ROUTER_MODELS</key><string>$ROUTER_MODELS</string>
-    <key>CLAUDE_ROUTER_FALLBACK_MODEL</key><string>off</string>
+    <key>CLAUDE_ROUTER_LOCAL_RE</key><string>$ROUTER_LOCAL_RE</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
@@ -129,7 +136,7 @@ Restart=always
 RestartSec=2
 Environment=CLAUDE_ROUTER_PORT=$PORT
 Environment=CLAUDE_ROUTER_MODELS=$ROUTER_MODELS
-Environment=CLAUDE_ROUTER_FALLBACK_MODEL=off
+Environment=CLAUDE_ROUTER_LOCAL_RE=$ROUTER_LOCAL_RE
 
 [Install]
 WantedBy=default.target
