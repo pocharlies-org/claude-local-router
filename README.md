@@ -135,7 +135,7 @@ export ANTHROPIC_AUTH_TOKEN="sk-..."                           # a key scoped to
 
 Service-level knobs go in the unit/plist — see the header of
 [`plugins/local-router/bin/claude-router.js`](plugins/local-router/bin/claude-router.js),
-which documents all 12 with their defaults. The ones you are most likely to touch:
+which documents all 14 with their defaults. The ones you are most likely to touch:
 
 | variable | default | meaning |
 |---|---|---|
@@ -144,12 +144,16 @@ which documents all 12 with their defaults. The ones you are most likely to touc
 | `CLAUDE_ROUTER_MODELS` | the 9 aliases deployed on the x86 | what `/v1/models` advertises |
 | `CLAUDE_ROUTER_ROUTING_CONFIG_URL` | `http://10.43.80.147:9002/api/model-routing/config` | dashboard routing config, read only on the `LOCAL_RE` branch |
 | `CLAUDE_ROUTER_CLAUDE_PLAN_MODEL` | `claude-opus-5` | where a session the dashboard marked `plan=claude` goes |
+| `CLAUDE_ROUTER_FORCE_LOCAL_MODEL` | *(empty = off)* | rewrite the requested model to this one **before** routing, so a session born anywhere (phone via RC, Claude Desktop, VS Code) lands on the same local resident even when it asks for `claude-opus-5`. Turn it on in a systemd **drop-in**, not in the unit — the SessionStart hook regenerates the unit |
 
 > **There is no automatic diversion to Anthropic.** The `CLAUDE_ROUTER_FALLBACK_MODEL`
 > (local-saturated) and `CLAUDE_ROUTER_CLOUD_FALLBACK_MODEL` (quota) knobs were removed
 > on 17-09-2026 along with the code behind them: saturation is handled by admission
 > control inside LiteLLM, and a session reaches Opus only when the operator says so in
 > the dashboard. Setting those variables now does nothing.
+>
+> `CLAUDE_ROUTER_FORCE_LOCAL_MODEL` is the **opposite** direction (Anthropic → local) and is
+> not automatic either: it only does what the operator put in the drop-in.
 
 ## Commands
 
