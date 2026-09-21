@@ -38,6 +38,14 @@
 //   CLAUDE_ROUTER_CLAUDE_PLAN_MAX_TOKENS (64000) tope de max_tokens al desviar (0 = no tocar):
 //                            el destino trae SU tope, no hereda el del modelo local (leccion
 //                            del desvio por cuota retirado el 17-09).
+//   CLAUDE_ROUTER_FORCE_LOCAL_MODEL   ('' = apagado) reescribe el modelo pedido por este
+//                            ANTES de enrutar. Sirve para que TODAS las sesiones de la
+//                            maquina caigan en el residente local aunque pidan
+//                            claude-opus-5: una sesion nacida en Claude Desktop esquiva el
+//                            wrapper de RC (solo toca a los hijos con --sdk-url) y se iba
+//                            a Anthropic. Valvula: vaciarlo en un drop-in de systemd.
+//   CLAUDE_ROUTER_FORCE_LOCAL_RE      ('^claude-(opus|sonnet)') que modelos reescribe.
+//                            'off'/'no'/'0' en MODEL lo apaga aunque RE tenga valor.
 // NO hay desvio automatico a ningun modelo de Anthropic por saturacion local: ver
 // "Por que ya no hay desvio a Opus" en el README. A Opus se va solo si lo elige el usuario.
 // La UNICA excepcion es la puerta claude de INFRA-208: no es automatica, es la voluntad
@@ -95,7 +103,7 @@ let LITELLM = loadLiteLLM();
 process.on('SIGHUP', () => { try { LITELLM = loadLiteLLM(); log(`reload ok litellm=${LITELLM.url.host}`); } catch (e) { log(`reload ERROR ${e.message}`); } });
 
 const agents = { 'https:': new https.Agent({ keepAlive: true }), 'http:': new http.Agent({ keepAlive: true }) };
-const stats = { started: new Date().toISOString(), anthropic: 0, litellm: 0, errors: 0, blocked: 0, cleaned: 0, models: 0, plan_claude: 0 };
+const stats = { started: new Date().toISOString(), anthropic: 0, litellm: 0, errors: 0, blocked: 0, cleaned: 0, models: 0, plan_claude: 0, forced: 0 };
 
 // --- puerta claude (INFRA-208 PR 4/4) ------------------------------------------------
 // El router decide claude-vs-litellm; el hook de LiteLLM decide local-vs-alibaba. Aqui
@@ -114,6 +122,22 @@ const PLAN_BETA = (() => {
   return /^(off|no|0)$/i.test(v.trim()) ? '' : v.trim();
 })();
 const PLAN_MAX_TOKENS = Number(process.env.CLAUDE_ROUTER_CLAUDE_PLAN_MAX_TOKENS ?? 64000);
+
+// --- FORCE-LOCAL ----------------------------------------------------------------------
+// Una sola variable: reescribe el modelo ANTES de enrutar, asi que una sesion nacida en
+// cualquier parte (movil via RC, Claude Desktop, VS Code) cae en el mismo residente local
+// aunque pida claude-opus-5. Nace del problema de las entradas: el wrapper de RC solo
+// toca a los hijos con --sdk-url, y una sesion `claude-desktop` lo esquiva y se va a
+// Anthropic. Aqui no hay argv que mirar: se mira el modelo del body.
+// No pisa la puerta claude: esa solo se dispara con modelo LOCAL ya elegido por sesion;
+// esto va al reves (modelo de Anthropic -> local) y respeta quien pida un modelo no local.
+// Valvula: vaciar CLAUDE_ROUTER_FORCE_LOCAL_MODEL en un drop-in de systemd (sobrevive al
+// hook que regenera la unidad) => comportamiento anterior al instante, sin tocar codigo.
+const FORCE_LOCAL_MODEL = (() => {
+  const v = (process.env.CLAUDE_ROUTER_FORCE_LOCAL_MODEL || '').trim();
+  return /^(off|no|0)?$/i.test(v) ? '' : v;
+})();
+const FORCE_LOCAL_RE = new RegExp(process.env.CLAUDE_ROUTER_FORCE_LOCAL_RE || '^claude-(opus|sonnet)', 'i');
 
 const routingCache = { cfg: null, expires: 0, inflight: null };
 function routingConfig() {
@@ -243,7 +267,8 @@ const server = http.createServer((req, res) => {
   if (req.url === '/-/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, port: PORT, litellm: LITELLM.url.host, local_re: LOCAL_RE.source,
-      mixed: MIXED, bad_keys: BAD_KEYS, ...stats }));
+      mixed: MIXED, bad_keys: BAD_KEYS, force_local: FORCE_LOCAL_MODEL || null,
+      force_local_re: FORCE_LOCAL_RE.source, ...stats }));
   }
   // GET /v1/models: el CLI de Claude valida --model contra esta lista (arranque frio y
   // subagentes la vuelven a pedir). Sin handler cae en el passthrough a api.anthropic.com,
@@ -272,10 +297,17 @@ const server = http.createServer((req, res) => {
   const chunks = [];
   req.on('data', (c) => chunks.push(c));
   req.on('end', () => {
-    const body = Buffer.concat(chunks);
+    let body = Buffer.concat(chunks);
     let payload = null;
     try { payload = JSON.parse(body.toString('utf8')); } catch {} // no parsea: se reenvia tal cual
-    const model = (payload && payload.model) || '?';
+    let model = (payload && payload.model) || '?';
+    if (FORCE_LOCAL_MODEL && payload && FORCE_LOCAL_RE.test(model) && !/count_tokens/.test(req.url)) {
+      log(`FORCE-LOCAL model=${model} -> ${FORCE_LOCAL_MODEL} (${req.url})`);
+      payload.model = FORCE_LOCAL_MODEL;
+      body = Buffer.from(JSON.stringify(payload));
+      model = FORCE_LOCAL_MODEL;
+      stats.forced++;
+    }
     const h = { ...req.headers }; delete h.host; delete h['transfer-encoding']; h['content-length'] = String(body.length);
     // Camino Anthropic: passthrough OAuth + guardrail MIXED (strip/block del
     // historial local envenenado). Tambien lo usa la puerta claude de INFRA-208.

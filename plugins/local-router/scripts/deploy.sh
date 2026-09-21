@@ -38,6 +38,21 @@ ROUTER_MODELS="${CLAUDE_ROUTER_MODELS:-${ROUTER_MODELS:-qwen38-flash-next,qwen38
 # LOCAL_RE decide que NO se va a Anthropic. Sin `q38-` en la regex, los cuatro
 # perfiles de chat pegan contra la API de Anthropic y el CLI corta con 404.
 ROUTER_LOCAL_RE="${CLAUDE_ROUTER_LOCAL_RE:-^(qwen|tooling|or-|alibaba-|q38-|litellm/)}"
+# FORCE-LOCAL reescribe claude-opus/sonnet -> residente local ANTES de enrutar, para que
+# una sesion nacida en cualquier sitio (movil por RC, Claude Desktop, VS Code) caiga en el
+# mismo modelo: el wrapper de RC solo toca a los hijos con --sdk-url y una sesion
+# "claude-desktop" lo esquiva. El ESTADO ON NO va en la unidad: esta la regenera el hook
+# de SessionStart en cada despliegue y se lo llevaria por delante. Se enciende con drop-in
+# (systemctl --user edit claude-router.service ->
+#   Environment=CLAUDE_ROUTER_FORCE_LOCAL_MODEL=qwen38-flash-next), que sobrevive.
+# Aqui solo se propaga si quien despliega lo pasa a mano (pruebas puntuales).
+FORCE_ENV_LINE=""
+PLIST_FORCE=""
+if [ -n "${CLAUDE_ROUTER_FORCE_LOCAL_MODEL:-}" ]; then
+  FORCE_ENV_LINE="Environment=CLAUDE_ROUTER_FORCE_LOCAL_MODEL=$CLAUDE_ROUTER_FORCE_LOCAL_MODEL"
+  # En launchd no hay drop-ins: ahi el encendido se pasa por el entorno de quien despliega.
+  PLIST_FORCE="    <key>CLAUDE_ROUTER_FORCE_LOCAL_MODEL</key><string>$CLAUDE_ROUTER_FORCE_LOCAL_MODEL</string>"
+fi
 
 log() { printf '%s\n' "$*"; }
 die() { printf '! %s\n' "$*" >&2; exit 1; }
@@ -109,6 +124,7 @@ if [ "$SVC" = launchd ]; then
     <key>CLAUDE_ROUTER_PORT</key><string>$PORT</string>
     <key>CLAUDE_ROUTER_MODELS</key><string>$ROUTER_MODELS</string>
     <key>CLAUDE_ROUTER_LOCAL_RE</key><string>$ROUTER_LOCAL_RE</string>
+$PLIST_FORCE
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
@@ -137,6 +153,9 @@ RestartSec=2
 Environment=CLAUDE_ROUTER_PORT=$PORT
 Environment=CLAUDE_ROUTER_MODELS=$ROUTER_MODELS
 Environment=CLAUDE_ROUTER_LOCAL_RE=$ROUTER_LOCAL_RE
+UNIT
+  if [ -n "$FORCE_ENV_LINE" ]; then printf '%s\n' "$FORCE_ENV_LINE" >> "$UNIT"; fi
+  cat >> "$UNIT" <<'UNIT'
 
 [Install]
 WantedBy=default.target
