@@ -181,14 +181,28 @@ changed=[];added=[]
 env=cfg.setdefault("env",{}); want=f"http://127.0.0.1:{port}"
 if env.get("ANTHROPIC_BASE_URL")!=want: env["ANTHROPIC_BASE_URL"]=want; changed.append("env.ANTHROPIC_BASE_URL")
 picker=cfg.setdefault("modelPicker",{}); opts=picker.setdefault("options",[])
+# Las filas que pone ESTE script se marcan con su descripcion y son las unicas
+# que puede retirar. Sin esta reconciliacion el picker solo crece: un alias que
+# el router deja de publicar (un renombrado, un perfil retirado) se queda como
+# fila para siempre y el usuario ve el mismo modelo varias veces con nombres
+# distintos — medido el 22-09-2026, cinco alias muertos resucitados en cada
+# SessionStart porque el hook re-ejecuta este deploy en cada arranque.
+MARCA="via claude-local-router"
+removed=[o.get("model") for o in opts
+         if isinstance(o,dict) and o.get("description")==MARCA and o.get("model") not in models]
+if removed:
+    opts[:] = [o for o in opts
+               if not (isinstance(o,dict) and o.get("description")==MARCA
+                       and o.get("model") not in models)]
 have={o.get("model") for o in opts if isinstance(o,dict)}
 for m in models:
     if m in have: continue
-    opts.append({"model":m,"label":f"{m} (local)","description":"via claude-local-router","behavesAs":"sonnet"}); added.append(m)
-if changed or added:
+    opts.append({"model":m,"label":f"{m} (local)","description":MARCA,"behavesAs":"sonnet"}); added.append(m)
+if changed or added or removed:
     json.dump(cfg,open(path,"w"),indent=2,ensure_ascii=False); open(path,"a").write("\n")
     if changed: print("  "+", ".join(changed))
     if added: print("  picker: "+", ".join(added))
+    if removed: print("  picker (retiradas, ya no las publica el router): "+", ".join(removed))
 PY
 
 # ------------------------------------------------------------------ verify
