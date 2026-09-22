@@ -10,10 +10,12 @@
 // Solo escucha en 127.0.0.1. Sin dependencias. Config por entorno:
 //   CLAUDE_ROUTER_PORT       (18791)
 //   CLAUDE_ROUTER_LOCAL_RE   ('^(qwen|tooling|or-|alibaba-|q38-|litellm/)', case-insensitive)
-//                            `q38-` son los cuatro perfiles de chat (OWU-50):
-//                            q38-flash, q38-flash-think, q38-flash-u, q38-flash-u-think.
-//                            Sin rama en esta regex, esos nombres se van a Anthropic
-//                            y el CLI corta con 404 (medido el 21-09).
+//                            `q38-` son los nombres VIEJOS de la matriz de chat
+//                            (OWU-50), hoy puente con caducidad ~27-09 en LiteLLM;
+//                            los nuevos (`qwen38-off`, `qwen38-u-off`) caen ya en
+//                            la rama `qwen`. Sin rama para `q38-`, una sesion
+//                            fijada al nombre viejo se va a Anthropic y el CLI
+//                            corta con 404 (medido el 21-09).
 //   CLAUDE_ROUTER_MODELS     lista de /v1/models (default: el set desplegado en el x86,
 //                            ver systemd/claude-router.service)
 //   CLAUDE_ROUTER_ENV_FILE   (~/.config/claude-local/env: export ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN)
@@ -253,15 +255,14 @@ const server = http.createServer((req, res) => {
     const ids = (process.env.CLAUDE_ROUTER_MODELS
       // Default = el set que la unidad systemd del x86 ya pinneaba por entorno
       // (drift reconciliado, INFRA-208): instalar desde main reproduce lo desplegado
-      // sin depender del env de la unidad. De los cuatro perfiles de chat de
-      // OWU-50 solo entran los dos `off` (`q38-flash`, `q38-flash-u`): los dos
-      // `-think` son el MISMO residente con tier `low`, que ya es el default de
-      // `qwen38-flash-next` / `qwen38-flash-next-uncensored` — en el picker solo
-      // apilaban filas duplicadas (21-09). Siguen alcanzables: la ruta los
-      // enruta (LOCAL_RE) y `/model q38-flash-think` a mano funciona; lo que se
-      // retira es la fila, no el alias (los consumen Open WebUI / Hermes).
+      // sin depender del env de la unidad. De la matriz de chat de OWU-50 solo
+      // entran los dos `off` (`qwen38-off`, `qwen38-u-off`, renombrados 22-09):
+      // los dos `-think` murieron — el nivel es parametro, y pensar en `low` ya
+      // lo promete `qwen38-flash-next` / `-uncensored`. Los nombres viejos siguen
+      // alcanzables (LOCAL_RE enruta `q38-`, y LiteLLM los resuelve por puente
+      // hasta su caducidad ~27-09); lo que no se publica es la fila.
       || 'qwen38-flash-next,qwen38-flash-next-uncensored,tooling,alibaba-q38-flash,alibaba-q38-max,'
-        + 'q38-flash,q38-flash-u')
+        + 'qwen38-off,qwen38-u-off')
       .split(',').map((s) => s.trim()).filter(Boolean);
     const data = ids.map((id) => ({ type: 'model', id, display_name: id, created_at: '2026-01-01T00:00:00Z' }));
     stats.models++;
