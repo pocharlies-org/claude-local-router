@@ -88,3 +88,13 @@ jobs:
           set -euo pipefail
           grep -q 'scripts/deploy.sh' plugins/local-router/hooks/hooks.json \
             || { echo "::error::el SessionStart hook ya no ejecuta deploy.sh"; exit 1; }
+
+      # 23-09-2026: deploy.sh reescribia ANTHROPIC_BASE_URL al router en un host con proxy
+      # frontal (HTTPS_PROXY de loopback + URL first-party) y dejaba de publicar las sesiones
+      # de Remote Control. La logica del settings vive en settings_env.py y se prueba aqui.
+      - name: settings_env respeta el modo frente
+        run: |
+          set -euo pipefail
+          grep -q 'scripts/settings_env.py' plugins/local-router/scripts/deploy.sh \
+            || { echo "::error::deploy.sh ya no usa settings_env.py"; exit 1; }
+          python3 -m unittest plugins/local-router/scripts/test_settings_env.py -v

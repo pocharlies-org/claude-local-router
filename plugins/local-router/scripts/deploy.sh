@@ -164,46 +164,12 @@ UNIT
   systemctl --user enable --now claude-router.service
 fi
 
-# ---- settings.json: point Claude Code at the router + register the picker models ----
+# ---- settings.json: point Claude Code at the router (unless a local front already does) + picker ----
 if [ -f "$SETTINGS" ]; then cp "$SETTINGS" "$SETTINGS.bak-$(date +%Y%m%d-%H%M%S)"; fi
-SETTINGS="$SETTINGS" ROUTER_MODELS="$ROUTER_MODELS" PORT="$PORT" python3 - <<'PY'
-import json, os, sys
-path=os.environ["SETTINGS"]; port=os.environ["PORT"]
-models=[m.strip() for m in os.environ["ROUTER_MODELS"].split(",") if m.strip()]
-try:
-    cfg=json.load(open(path))
-    if not isinstance(cfg,dict): raise ValueError("raiz no es objeto JSON")
-except FileNotFoundError: cfg={}
-except Exception as e:
-    print(f"! {path}: {e} — edítalo a mano: env.ANTHROPIC_BASE_URL=http://127.0.0.1:{port}")
-    sys.exit(0)
-changed=[];added=[]
-env=cfg.setdefault("env",{}); want=f"http://127.0.0.1:{port}"
-if env.get("ANTHROPIC_BASE_URL")!=want: env["ANTHROPIC_BASE_URL"]=want; changed.append("env.ANTHROPIC_BASE_URL")
-picker=cfg.setdefault("modelPicker",{}); opts=picker.setdefault("options",[])
-# Las filas que pone ESTE script se marcan con su descripcion y son las unicas
-# que puede retirar. Sin esta reconciliacion el picker solo crece: un alias que
-# el router deja de publicar (un renombrado, un perfil retirado) se queda como
-# fila para siempre y el usuario ve el mismo modelo varias veces con nombres
-# distintos — medido el 22-09-2026, cinco alias muertos resucitados en cada
-# SessionStart porque el hook re-ejecuta este deploy en cada arranque.
-MARCA="via claude-local-router"
-removed=[o.get("model") for o in opts
-         if isinstance(o,dict) and o.get("description")==MARCA and o.get("model") not in models]
-if removed:
-    opts[:] = [o for o in opts
-               if not (isinstance(o,dict) and o.get("description")==MARCA
-                       and o.get("model") not in models)]
-have={o.get("model") for o in opts if isinstance(o,dict)}
-for m in models:
-    if m in have: continue
-    opts.append({"model":m,"label":f"{m} (local)","description":MARCA,"behavesAs":"sonnet"}); added.append(m)
-if changed or added or removed:
-    json.dump(cfg,open(path,"w"),indent=2,ensure_ascii=False); open(path,"a").write("\n")
-    if changed: print("  "+", ".join(changed))
-    if added: print("  picker: "+", ".join(added))
-    if removed: print("  picker (retiradas, ya no las publica el router): "+", ".join(removed))
-PY
+# La lógica vive en settings_env.py (probada en CI). Respeta el "modo frente": con un
+# HTTPS_PROXY de loopback y ANTHROPIC_BASE_URL=https://api.anthropic.com (el x86 desde el
+# 22-09, para que Remote Control publique las sesiones) NO toca ANTHROPIC_BASE_URL.
+SETTINGS="$SETTINGS" ROUTER_MODELS="$ROUTER_MODELS" PORT="$PORT" python3 "$ROOT/scripts/settings_env.py"
 
 # ------------------------------------------------------------------ verify
 if grep -q CHANGEME "$ENV_FILE" 2>/dev/null; then
