@@ -40,6 +40,13 @@
 //   CLAUDE_ROUTER_CLAUDE_PLAN_MAX_TOKENS (64000) tope de max_tokens al desviar (0 = no tocar):
 //                            el destino trae SU tope, no hereda el del modelo local (leccion
 //                            del desvio por cuota retirado el 17-09).
+//   Interruptor «Claude» de la COMPANIA (23-09-2026): la misma config trae el campo
+//                            aditivo `company: {claude, alibaba}` (panel Settings de
+//                            dgx.e-dani.com/claude-sessions). Con company.claude === false,
+//                            una peticion con `x-claude-class: company` (la cabecera que
+//                            estampa company_env.py en el x86) NO sale a Anthropic: POST
+//                            /v1/messages -> 403 claro, y la puerta plan=claude no la desvia.
+//                            Solo la compania; sin config o con el campo ausente, como hoy.
 // NO hay desvio automatico a ningun modelo de Anthropic por saturacion local: ver
 // "Por que ya no hay desvio a Opus" en el README. A Opus se va solo si lo elige el usuario.
 // La UNICA excepcion es la puerta claude de INFRA-208: no es automatica, es la voluntad
@@ -97,7 +104,7 @@ let LITELLM = loadLiteLLM();
 process.on('SIGHUP', () => { try { LITELLM = loadLiteLLM(); log(`reload ok litellm=${LITELLM.url.host}`); } catch (e) { log(`reload ERROR ${e.message}`); } });
 
 const agents = { 'https:': new https.Agent({ keepAlive: true }), 'http:': new http.Agent({ keepAlive: true }) };
-const stats = { started: new Date().toISOString(), anthropic: 0, litellm: 0, errors: 0, blocked: 0, cleaned: 0, models: 0, plan_claude: 0, forced_local: 0 };
+const stats = { started: new Date().toISOString(), anthropic: 0, litellm: 0, errors: 0, blocked: 0, cleaned: 0, models: 0, plan_claude: 0, forced_local: 0, company_blocked: 0 };
 
 // --- puerta claude (INFRA-208 PR 4/4) ------------------------------------------------
 // El router decide claude-vs-litellm; el hook de LiteLLM decide local-vs-alibaba. Aqui
@@ -169,6 +176,26 @@ function planIsClaude(cfg, sid) {
   // Default solo con sticky activo: misma semantica que el hook de LiteLLM (los flags
   // gobiernan los mecanismos automaticos; sin sticky, el default_plan no aplica).
   return cfg.sticky === true && cfg.default_plan === 'claude';
+}
+
+// --- interruptor «Claude» de la compania (23-09-2026) ------------------------------
+// La compania se reconoce por la cabecera que estampa company_env.py (x86-host-runtime) en
+// toda sesion que lanza el supervisor: la misma que usa el hook de LiteLLM (contrato
+// dgx.claude.class-header.v1). Solo un `false` explicito en config.company.claude apaga.
+const CLASS_HEADER = 'x-claude-class';
+function isCompany(req) {
+  return String(req.headers[CLASS_HEADER] || '').trim().toLowerCase() === 'company';
+}
+function companyClaudeOff(cfg) {
+  return !!(cfg && typeof cfg === 'object' && cfg.company && typeof cfg.company === 'object'
+    && cfg.company.claude === false);
+}
+function rejectCompanyClaude(res, model) {
+  stats.company_blocked++;
+  if (!res.headersSent) res.writeHead(403, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error',
+    message: `claude-router: la compania tiene Claude desactivado (dgx.e-dani.com/claude-sessions#settings); `
+      + `${model} no sale a Anthropic. Usa el fallback del rol o el LLM local.` } }));
 }
 
 // --- guardrail: historial del modelo LOCAL hacia Anthropic ----------------------
@@ -355,6 +382,11 @@ const server = http.createServer((req, res) => {
       if (!payload) return sendLocal(); // body ilegible: no hay desvio posible
       return routingConfig().then((cfg) => {
         if (!planIsClaude(cfg, sid)) return sendLocal();
+        // Interruptor «Claude» de la compania: un plan=claude no la saca a Anthropic.
+        if (isCompany(req) && companyClaudeOff(cfg)) {
+          log(`PLAN-CLAUDE ignorado: compania con Claude desactivado model=${model} sid=${sid || '-'}`);
+          return sendLocal();
+        }
         stats.plan_claude++;
         // La sesion local pide un alias que Anthropic no conoce: el desvio trae
         // SU modelo, SU ventana (beta) y SU tope de salida. OAuth se conserva
@@ -375,6 +407,18 @@ const server = http.createServer((req, res) => {
         // guardrail MIXED (los tool_use envenenados siguen ahi).
         return sendAnthropic(hdrs, outBody, `ANTHROPIC(plan=claude) model=${PLAN_MODEL}`);
       }, () => sendLocal());
+    }
+    // Interruptor «Claude» de la compania: solo las peticiones que gastan (POST /v1/messages,
+    // no count_tokens) y solo con la cabecera de la compania. Config inalcanzable => null =>
+    // pasa, como hoy (fail-open, mismo criterio que la puerta plan=claude).
+    if (isCompany(req) && /^\/v1\/messages(\?|$)/.test(req.url)) {
+      return routingConfig().then((cfg) => {
+        if (companyClaudeOff(cfg)) {
+          log(`COMPANIA-SIN-CLAUDE model=${model} ${req.url} -> 403`);
+          return rejectCompanyClaude(res, model);
+        }
+        return sendAnthropic(h, body, `ANTHROPIC model=${model}`);
+      }, () => sendAnthropic(h, body, `ANTHROPIC model=${model}`));
     }
     return sendAnthropic(h, body, `ANTHROPIC model=${model}`);
   });
