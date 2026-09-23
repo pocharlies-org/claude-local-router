@@ -97,7 +97,7 @@ let LITELLM = loadLiteLLM();
 process.on('SIGHUP', () => { try { LITELLM = loadLiteLLM(); log(`reload ok litellm=${LITELLM.url.host}`); } catch (e) { log(`reload ERROR ${e.message}`); } });
 
 const agents = { 'https:': new https.Agent({ keepAlive: true }), 'http:': new http.Agent({ keepAlive: true }) };
-const stats = { started: new Date().toISOString(), anthropic: 0, litellm: 0, errors: 0, blocked: 0, cleaned: 0, models: 0, plan_claude: 0 };
+const stats = { started: new Date().toISOString(), anthropic: 0, litellm: 0, errors: 0, blocked: 0, cleaned: 0, models: 0, plan_claude: 0, forced_local: 0 };
 
 // --- puerta claude (INFRA-208 PR 4/4) ------------------------------------------------
 // El router decide claude-vs-litellm; el hook de LiteLLM decide local-vs-alibaba. Aqui
@@ -116,6 +116,25 @@ const PLAN_BETA = (() => {
   return /^(off|no|0)$/i.test(v.trim()) ? '' : v.trim();
 })();
 const PLAN_MAX_TOKENS = Number(process.env.CLAUDE_ROUTER_CLAUDE_PLAN_MAX_TOKENS ?? 64000);
+
+// --- sesiones marcadas "siempre local" (23-09-2026) ------------------------------------
+// Las sesiones que spawnea el servidor de Remote Control (claude-rc-k8s en el x86) nacen
+// con --model local (lo reescribe su lanzador), pero el cliente las cambia EN CALIENTE:
+// Claude Desktop manda un `set_model` con el modelo de su selector ~1 s despues del
+// arranque (medido: bootstrap con model=qwen38-flash-next y la primera /v1/messages ya
+// con claude-opus-5-5). Ese mensaje entra por el canal del bridge, no por argv, asi que
+// el lanzador no lo ve; y ni `availableModels` ni ANTHROPIC_DEFAULT_*_MODEL lo paran
+// (el segundo solo cubre alias, no ids completos).
+//
+// Quien lanza la sesion la MARCA con esta cabecera (ANTHROPIC_CUSTOM_HEADERS) y el valor
+// es el modelo local. Con la marca, un modelo que no casa LOCAL_RE se reescribe a ese
+// valor y sigue por la rama local de siempre (puerta claude incluida). No es un desvio
+// silencioso de los que se retiraron arriba: lo pide explicitamente el lanzador, se
+// loguea por peticion (FORZADO-LOCAL), y sin la marca no cambia nada.
+// El tope de max_tokens es por lo mismo que en el desvio plan=claude: el destino trae SU
+// tope, no hereda el del modelo de origen (0 = no tocar).
+const FORCE_HEADER = 'x-claude-router-force-local';
+const FORCE_MAX_TOKENS = Number(process.env.CLAUDE_ROUTER_FORCE_LOCAL_MAX_TOKENS ?? 32000);
 
 const routingCache = { cfg: null, expires: 0, inflight: null };
 function routingConfig() {
@@ -271,18 +290,29 @@ const server = http.createServer((req, res) => {
   }
   const routed = req.method === 'POST' && /^\/v1\/messages(\/count_tokens)?(\?|$)/.test(req.url);
   if (!routed) {
-    const h = { ...req.headers }; delete h.host;
+    const h = { ...req.headers }; delete h.host; delete h[FORCE_HEADER];
     stats.anthropic++;
     return forward(req, res, ANTHROPIC, h, undefined, 'ANTHROPIC(passthrough)');
   }
   const chunks = [];
   req.on('data', (c) => chunks.push(c));
   req.on('end', () => {
-    const body = Buffer.concat(chunks);
+    let body = Buffer.concat(chunks);
     let payload = null;
     try { payload = JSON.parse(body.toString('utf8')); } catch {} // no parsea: se reenvia tal cual
-    const model = (payload && payload.model) || '?';
-    const h = { ...req.headers }; delete h.host; delete h['transfer-encoding']; h['content-length'] = String(body.length);
+    let model = (payload && payload.model) || '?';
+    const force = String(req.headers[FORCE_HEADER] || '').trim();
+    const h = { ...req.headers }; delete h.host; delete h['transfer-encoding']; delete h[FORCE_HEADER];
+    if (force && payload && LOCAL_RE.test(force) && !LOCAL_RE.test(model)) {
+      payload.model = force;
+      if (FORCE_MAX_TOKENS && typeof payload.max_tokens === 'number'
+          && payload.max_tokens > FORCE_MAX_TOKENS) payload.max_tokens = FORCE_MAX_TOKENS;
+      body = Buffer.from(JSON.stringify(payload));
+      stats.forced_local++;
+      log(`FORZADO-LOCAL model=${model} -> ${force} ${req.url}`);
+      model = force;
+    }
+    h['content-length'] = String(body.length);
     // Camino Anthropic: passthrough OAuth + guardrail MIXED (strip/block del
     // historial local envenenado). Tambien lo usa la puerta claude de INFRA-208.
     const sendAnthropic = (hdrs, inBody, tag) => {
