@@ -264,13 +264,36 @@ function fail(res, status, msg) {
   res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: `claude-router: ${msg}` } }));
 }
 
-function forward(req, res, target, headers, body, tag) {
+// --- peticiones de la compania en vuelo (23-09-2026) ---------------------------------
+// El supervisor de la compania (jira-epic-trigger, x86-host-runtime) frena por SU carga en
+// el LLM local, no por el total del vLLM (que incluye hermes, blog, sesiones de Dani...).
+// Aqui se ve cada POST /v1/messages de la compania que va a LiteLLM y, por la cabecera de
+// respuesta x-litellm-model-group, si el hook session_router lo dejo en el residente o lo
+// desbordo a Alibaba (company_overflow). `pendiente` = aun sin cabeceras: LiteLLM lo tiene
+// en admision o en cola del residente, cuenta como local. GET /-/health -> company_inflight.
+const companyInflight = new Map();
+let companySeq = 0;
+function companyInflightStats() {
+  const out = { local: 0, alibaba: 0, pendiente: 0 };
+  for (const v of companyInflight.values()) out[v] = (out[v] || 0) + 1;
+  return out;
+}
+
+function forward(req, res, target, headers, body, tag, trackCompany) {
   const t0 = Date.now();
+  let cid = null;
+  if (trackCompany) { cid = ++companySeq; companyInflight.set(cid, 'pendiente'); }
+  const done = () => { if (cid !== null) { companyInflight.delete(cid); cid = null; } };
+  res.on('close', done); res.on('finish', done);
   const mod = target.protocol === 'https:' ? https : http;
   const up = mod.request({
     protocol: target.protocol, hostname: target.hostname, port: target.port || undefined, agent: agents[target.protocol],
     method: req.method, path: req.url, headers: { ...headers, host: target.host },
   }, (ur) => {
+    if (cid !== null) {
+      const group = String(ur.headers['x-litellm-model-group'] || '').toLowerCase();
+      companyInflight.set(cid, group.startsWith('alibaba-') ? 'alibaba' : 'local');
+    }
     res.writeHead(ur.statusCode, ur.headers);
     ur.pipe(res);
     ur.on('end', () => log(`${tag} ${ur.statusCode} ${Date.now() - t0}ms ${req.method} ${req.url}`));
@@ -291,7 +314,7 @@ const server = http.createServer((req, res) => {
   if (req.url === '/-/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, port: PORT, litellm: LITELLM.url.host, local_re: LOCAL_RE.source,
-      mixed: MIXED, bad_keys: BAD_KEYS, ...stats }));
+      mixed: MIXED, bad_keys: BAD_KEYS, ...stats, company_inflight: companyInflightStats() }));
   }
   // GET /v1/models: el CLI de Claude valida --model contra esta lista (arranque frio y
   // subagentes la vuelven a pedir). Sin handler cae en el passthrough a api.anthropic.com,
@@ -371,7 +394,8 @@ const server = http.createServer((req, res) => {
       delete h['x-api-key']; delete h.authorization;
       h.authorization = `Bearer ${LITELLM.key}`;
       stats.litellm++;
-      return forward(req, res, LITELLM.url, h, body, `LITELLM  model=${model}`);
+      const track = isCompany(req) && /^\/v1\/messages(\?|$)/.test(req.url);
+      return forward(req, res, LITELLM.url, h, body, `LITELLM  model=${model}`, track);
     };
     // Puerta claude (INFRA-208): solo en la rama LOCAL_RE, solo claude-vs-litellm.
     // Local-vs-alibaba lo decide el hook session_router.py dentro de LiteLLM; el
