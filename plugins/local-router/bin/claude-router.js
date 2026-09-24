@@ -256,6 +256,22 @@ function claudeGate(cfg) {
   };
 }
 
+// --- Message Threads ("tether") hacia LiteLLM -----------------------------------
+// Con base URL first-party (el frente) el CLI activa la beta message-threads: en las
+// continuaciones manda SOLO el delta y deja el historial al servidor de Anthropic.
+// LiteLLM no guarda hilos, asi que el modelo local recibiria unos cientos de tokens sin
+// tools. El CLI trae el camino de vuelta: un 400 con error_code
+// `thread_unsupported_request` le hace reenviar ESE turno completo y dejar el hilo sin
+// estado en ESE modelo para el resto de la sesion (Opus conserva sus hilos).
+function rejectThread(res, model, threadType) {
+  stats.thread_rejected = (stats.thread_rejected || 0) + 1;
+  if (!res.headersSent) res.writeHead(400, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error',
+    message: `thread: Message Threads is not supported for ${model} (claude-router -> LiteLLM); `
+      + `resend this turn without thread (was ${threadType})`,
+    details: { error_code: 'thread_unsupported_request' } } }));
+}
+
 function rejectGate(res, model, gate) {
   stats.gate_blocked++;
   if (!res.headersSent) res.writeHead(403, { 'content-type': 'application/json' });
@@ -454,6 +470,11 @@ const server = http.createServer((req, res) => {
       return forward(req, res, ANTHROPIC, hdrs, outBody, tag);
     };
     const sendLocal = () => {
+      if (payload && payload.thread !== undefined && /^\/v1\/messages(\?|$)/.test(req.url)) {
+        const tt = (payload.thread && payload.thread.type) || '?';
+        log(`THREAD-400 model=${model} thread=${tt} ${req.url}`);
+        return rejectThread(res, model, tt);
+      }
       // Local es local, siempre. Si el modelo local esta saturado el turno tarda o se queda
       // mudo, y eso es VISIBLE: es el problema real, y taparlo con la suscripcion del usuario
       // era el desvio que va fuera (ver arriba). count_tokens tampoco se toca.
