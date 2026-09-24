@@ -135,7 +135,7 @@ export ANTHROPIC_AUTH_TOKEN="sk-..."                           # a key scoped to
 
 Service-level knobs go in the unit/plist — see the header of
 [`plugins/local-router/bin/claude-router.js`](plugins/local-router/bin/claude-router.js),
-which documents all 14 with their defaults. The ones you are most likely to touch:
+which documents them all with their defaults. The ones you are most likely to touch:
 
 | variable | default | meaning |
 |---|---|---|
@@ -145,6 +145,15 @@ which documents all 14 with their defaults. The ones you are most likely to touc
 | `CLAUDE_ROUTER_ROUTING_CONFIG_URL` | `http://10.43.80.147:9002/api/model-routing/config` | dashboard routing config, read only on the `LOCAL_RE` branch |
 | `CLAUDE_ROUTER_CLAUDE_PLAN_MODEL` | `claude-opus-5` | where a session the dashboard marked `plan=claude` goes |
 | `CLAUDE_ROUTER_FORCE_LOCAL_MODEL` | *(empty = off)* | rewrite the requested model to this one **before** routing, so a session born anywhere (phone via RC, Claude Desktop, VS Code) lands on the same local resident even when it asks for `claude-opus-5`. Turn it on in a systemd **drop-in**, not in the unit — the SessionStart hook regenerates the unit |
+| `CLAUDE_ROUTER_CLAUDE_GATE` | `off` | company-only policy knob: `rewrite` sends every Anthropic model **outside** the allow-list to the local resident, `block` rejects it with a 403. Exists because a `Task(model: …)` call overrides both the role's frontmatter `model:` and `CLAUDE_CODE_SUBAGENT_MODEL` — measured 24-09-2026, a subagent ran paid Sonnet 5 against the configured local default |
+| `CLAUDE_ROUTER_CLAUDE_GATE_ALLOW` | `claude-opus-5-5,claude-opus-5` | models a company session may still take to Anthropic under the gate |
+| `CLAUDE_ROUTER_CLAUDE_GATE_TARGET` | `qwen38-flash-next` | where `rewrite` sends the rest (must match `LOCAL_RE`) |
+| `CLAUDE_ROUTER_CLAUDE_GATE_MAX_TOKENS` | `32000` | output cap applied to the rewrite target — the target brings **its** window, it does not inherit the source's (lesson of the 17-09 diversion) |
+
+> The gate's live state is the `claude_gate` field of the company panel
+> (`company-control` ConfigMap → `company.claude_gate` in the routing config, same
+> Settings page as the claude/alibaba switches); the env vars are the fallback while
+> the field is unset. Panel value always wins, including `mode: "off"`.
 
 > **There is no automatic diversion to Anthropic.** The `CLAUDE_ROUTER_FALLBACK_MODEL`
 > (local-saturated) and `CLAUDE_ROUTER_CLOUD_FALLBACK_MODEL` (quota) knobs were removed

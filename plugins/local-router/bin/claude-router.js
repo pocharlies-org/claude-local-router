@@ -47,6 +47,22 @@
 //                            estampa company_env.py en el x86) NO sale a Anthropic: POST
 //                            /v1/messages -> 403 claro, y la puerta plan=claude no la desvia.
 //                            Solo la compania; sin config o con el campo ausente, como hoy.
+//   claude_gate de la COMPANIA (24-09-2026): el interruptor claude es todo-o-nada; el gate
+//                            deja salir a Anthropic SOLO los modelos de su lista y el resto
+//                            lo reescribe al residente (mode=rewrite) o lo corta (mode=block).
+//                            Nace porque el parametro `model` de un Task pisa el frontmatter
+//                            del rol y CLAUDE_CODE_SUBAGENT_MODEL a la vez (medido 24-09:
+//                            relevo de tech-lead servido en Sonnet 5 de pago contra la
+//                            config). Estado en el panel (CM company-control -> campo
+//                            aditivo company.claude_gate {mode, allow, target, max_tokens});
+//                            sin campo en la config manda el entorno:
+//   CLAUDE_ROUTER_CLAUDE_GATE                ('off' | 'rewrite' | 'block'; default 'off')
+//   CLAUDE_ROUTER_CLAUDE_GATE_ALLOW          ('claude-opus-5-5,claude-opus-5')
+//   CLAUDE_ROUTER_CLAUDE_GATE_TARGET         ('qwen38-flash-next') destino de la reescritura
+//   CLAUDE_ROUTER_CLAUDE_GATE_MAX_TOKENS     (32000) tope del destino (0 = no tocar)
+//                            Solo peticiones de la compania (x-claude-class) que gastan
+//                            (POST /v1/messages). Fail-safe: modo desconocido o config
+//                            ilegible => off => comportamiento actual.
 // NO hay desvio automatico a ningun modelo de Anthropic por saturacion local: ver
 // "Por que ya no hay desvio a Opus" en el README. A Opus se va solo si lo elige el usuario.
 // La UNICA excepcion es la puerta claude de INFRA-208: no es automatica, es la voluntad
@@ -104,7 +120,7 @@ let LITELLM = loadLiteLLM();
 process.on('SIGHUP', () => { try { LITELLM = loadLiteLLM(); log(`reload ok litellm=${LITELLM.url.host}`); } catch (e) { log(`reload ERROR ${e.message}`); } });
 
 const agents = { 'https:': new https.Agent({ keepAlive: true }), 'http:': new http.Agent({ keepAlive: true }) };
-const stats = { started: new Date().toISOString(), anthropic: 0, litellm: 0, errors: 0, blocked: 0, cleaned: 0, models: 0, plan_claude: 0, forced_local: 0, company_blocked: 0 };
+const stats = { started: new Date().toISOString(), anthropic: 0, litellm: 0, errors: 0, blocked: 0, cleaned: 0, models: 0, plan_claude: 0, forced_local: 0, company_blocked: 0, gate_rewritten: 0, gate_blocked: 0 };
 
 // --- puerta claude (INFRA-208 PR 4/4) ------------------------------------------------
 // El router decide claude-vs-litellm; el hook de LiteLLM decide local-vs-alibaba. Aqui
@@ -196,6 +212,56 @@ function rejectCompanyClaude(res, model) {
   res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error',
     message: `claude-router: la compania tiene Claude desactivado (dgx.e-dani.com/claude-sessions#settings); `
       + `${model} no sale a Anthropic. Usa el fallback del rol o el LLM local.` } }));
+}
+
+// --- claude gate de la compania (24-09-2026) -----------------------------------------
+// El interruptor «Claude» es todo-o-nada; este gate es fino: la compania puede seguir
+// usando los modelos de SU lista (los roles nacen fijados en el frontmatter: Opus 5.5)
+// pero NINGUN modelo de pago fuera de ella. Por que hace falta: el `model:` del
+// frontmatter y CLAUDE_CODE_SUBAGENT_MODEL son defaults, y el parametro `model` de un
+// Task los pisa los dos. Medido el 24-09: el CTO lanzo un relevo de tech-lead con
+// model:'sonnet' y se sirvio Sonnet 5 de pago mientras la config decia qwen38-flash-next.
+// Nadie lo habia decidido; lo improvisó el modelo. El router es el unico punto por el que
+// pasa esa peticion: aqui se cobra la politica, pase lo que pase por encima.
+// Parametrizable desde el MISMO panel que claude/alibaba (Settings de
+// dgx.e-dani.com/claude-sessions): el CM company-control guarda `subagent_gate` y
+// /api/model-routing/config lo proyecta ADITIVO como company.claude_gate
+// {mode: off|rewrite|block, allow: [modelos], target: modelo-local, max_tokens: N}.
+// Sin el campo en la config (panel sin desplegar o nunca tocado) manda el entorno.
+// Fail-safe como el resto: campo ilegible o modo desconocido => off => comportamiento actual.
+// Leccion del desvio retirado del 17-09: el destino de la reescritura trae SU tope de
+// salida (max_tokens), no hereda el del modelo de origen.
+const GATE_MODE = (process.env.CLAUDE_ROUTER_CLAUDE_GATE || 'off').toLowerCase();
+const GATE_ALLOW = (process.env.CLAUDE_ROUTER_CLAUDE_GATE_ALLOW || 'claude-opus-5-5,claude-opus-5')
+  .split(',').map((x) => x.trim()).filter(Boolean);
+const GATE_TARGET = process.env.CLAUDE_ROUTER_CLAUDE_GATE_TARGET || 'qwen38-flash-next';
+const GATE_MAX_TOKENS = Number(process.env.CLAUDE_ROUTER_CLAUDE_GATE_MAX_TOKENS ?? 32000);
+const GATE_MODES = ['off', 'rewrite', 'block'];
+
+function claudeGate(cfg) {
+  const g = cfg && typeof cfg === 'object' && cfg.company && typeof cfg.company === 'object'
+    ? cfg.company.claude_gate : null;
+  if (g && typeof g === 'object' && !Array.isArray(g)) {
+    const mode = String(g.mode || 'off').toLowerCase();
+    return {
+      mode: GATE_MODES.includes(mode) ? mode : 'off',
+      allow: Array.isArray(g.allow) ? g.allow.map(String) : GATE_ALLOW,
+      target: (typeof g.target === 'string' && g.target.trim()) ? g.target.trim() : GATE_TARGET,
+      maxTokens: Number.isFinite(Number(g.max_tokens)) ? Number(g.max_tokens) : GATE_MAX_TOKENS,
+    };
+  }
+  return {
+    mode: GATE_MODES.includes(GATE_MODE) ? GATE_MODE : 'off',
+    allow: GATE_ALLOW, target: GATE_TARGET, maxTokens: GATE_MAX_TOKENS,
+  };
+}
+
+function rejectGate(res, model, gate) {
+  stats.gate_blocked++;
+  if (!res.headersSent) res.writeHead(403, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error',
+    message: `claude-router: claude_gate=block de la compania; ${model} no esta en la lista `
+      + `permitida (${gate.allow.join(', ') || 'vacia'}). Cambiala en dgx.e-dani.com/claude-sessions#settings.` } }));
 }
 
 // --- guardrail: historial del modelo LOCAL hacia Anthropic ----------------------
@@ -440,6 +506,29 @@ const server = http.createServer((req, res) => {
         if (companyClaudeOff(cfg)) {
           log(`COMPANIA-SIN-CLAUDE model=${model} ${req.url} -> 403`);
           return rejectCompanyClaude(res, model);
+        }
+        // claude_gate: la compania solo saca a Anthropic los modelos de su lista.
+        // count_tokens no gasta y queda fuera (criterio del interruptor). Un modelo
+        // ya LOCAL_RE jamas lo toca este gate (la rama de arriba lo enruto ya).
+        const gate = claudeGate(cfg);
+        if (gate.mode !== 'off' && payload && !gate.allow.includes(model)) {
+          if (gate.mode === 'block') {
+            log(`GATE-BLOCK model=${model} ${req.url} -> 403`);
+            return rejectGate(res, model, gate);
+          }
+          if (LOCAL_RE.test(gate.target)) {
+            payload.model = gate.target;
+            if (gate.maxTokens && typeof payload.max_tokens === 'number'
+                && payload.max_tokens > gate.maxTokens) payload.max_tokens = gate.maxTokens;
+            body = Buffer.from(JSON.stringify(payload));
+            h['content-length'] = String(body.length);
+            stats.gate_rewritten++;
+            log(`GATE-LOCAL model=${model} -> ${gate.target} ${req.url}`);
+            model = gate.target;
+            return sendLocal();
+          }
+          // Target mal configurado (no es un modelo local): no se inventa ruta.
+          log(`GATE target=${gate.target} no casa LOCAL_RE: se reenvia model=${model} tal cual`);
         }
         return sendAnthropic(h, body, `ANTHROPIC model=${model}`);
       }, () => sendAnthropic(h, body, `ANTHROPIC model=${model}`));
