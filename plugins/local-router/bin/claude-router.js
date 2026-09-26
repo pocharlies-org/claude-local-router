@@ -361,6 +361,43 @@ function companyInflightStats() {
   return out;
 }
 
+// --- eventos de flip de backend (26-09-2026) ---------------------------------------------
+// Cuando LiteLLM sirve un turno desde Alibaba (sticky, válvula o fallback de timeout) el
+// CLI no se entera: el transcript registra el nombre PEDIDO (el gate reescribe
+// claude-opus-5-5 -> residente y devuelve el nombre pedido) y Claude Code descarta las
+// cabeceras x-litellm-*. El router es el unico punto del x86 que ve `x-litellm-model-group`
+// en la respuesta. Aqui se hace un seguimiento del backend por sesion y cada CAMBIO
+// (local<->alibaba) se añade como línea JSONL a backend-events.jsonl, que lee el Stop hook
+// del plugin (backend_flip_notify.py) para avisar «ha saltado el fallback» y «recuperado».
+// El primer avistamiento de una sesión NO emite evento: no es una transición, es la línea
+// de base. Fail-safe: cualquier error solo loggea; jamas rompe un turno.
+const FLIP_DIR = process.env.CLAUDE_ROUTER_FLIP_DIR || path.join(os.homedir(), '.cache', 'claude-local-router');
+const FLIP_FILE = path.join(FLIP_DIR, 'backend-events.jsonl');
+const FLIP_MAX_SESSIONS = Number(process.env.CLAUDE_ROUTER_FLIP_MAX_SESSIONS || 2000);
+const sessionBackend = new Map(); // sid -> 'local' | 'alibaba'
+let flipWarned = false;
+try { fs.mkdirSync(FLIP_DIR, { recursive: true }); } catch (e) { log(`flip dir: ${e.message}`); }
+function noteBackend(req, ur) {
+  try {
+    if (req.method !== 'POST' || !String(req.url).startsWith('/v1/messages')) return;
+    const sid = String(req.headers['x-claude-code-session-id'] || '').trim();
+    if (!sid) return;
+    const group = String(ur.headers['x-litellm-model-group'] || '').toLowerCase();
+    if (!group) return; // sin grupo no hay veredicto (passthrough Anthropic: stats.plan_claude lo cubre)
+    const backend = group.startsWith('alibaba-') ? 'alibaba' : 'local';
+    const prev = sessionBackend.get(sid);
+    sessionBackend.set(sid, backend);
+    if (sessionBackend.size > FLIP_MAX_SESSIONS) sessionBackend.delete(sessionBackend.keys().next().value);
+    if (!prev || prev === backend) return;
+    const ev = { ts: new Date().toISOString(), sid, from: prev, to: backend, group,
+      fallbacks: Number(ur.headers['x-litellm-attempted-fallbacks'] || 0) || 0 };
+    fs.appendFile(FLIP_FILE, JSON.stringify(ev) + '\n', (e) => {
+      if (e && !flipWarned) { flipWarned = true; log(`flip write ERROR ${e.message}`); }
+    });
+    log(`flip ${prev} -> ${backend} (group=${group}, sid=${sid})`);
+  } catch (e) { log(`flip ERROR ${e.message}`); }
+}
+
 function forward(req, res, target, headers, body, tag, trackCompany) {
   const t0 = Date.now();
   let cid = null;
@@ -376,6 +413,7 @@ function forward(req, res, target, headers, body, tag, trackCompany) {
       const group = String(ur.headers['x-litellm-model-group'] || '').toLowerCase();
       companyInflight.set(cid, group.startsWith('alibaba-') ? 'alibaba' : 'local');
     }
+    noteBackend(req, ur);
     res.writeHead(ur.statusCode, ur.headers);
     ur.pipe(res);
     ur.on('end', () => log(`${tag} ${ur.statusCode} ${Date.now() - t0}ms ${req.method} ${req.url}`));

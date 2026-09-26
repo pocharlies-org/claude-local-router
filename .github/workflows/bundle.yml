@@ -98,3 +98,17 @@ jobs:
           grep -q 'scripts/settings_env.py' plugins/local-router/scripts/deploy.sh \
             || { echo "::error::deploy.sh ya no usa settings_env.py"; exit 1; }
           python3 -m unittest plugins/local-router/scripts/test_settings_env.py -v
+
+      # 26-09-2026: el aviso de flip local<->alibaba vive en dos piezas que tienen que
+      # seguir casadas: noteBackend() en el binario (escribe backend-events.jsonl) y el
+      # Stop hook backend_flip_notify.py (lo lee). Si el binario deja de escribir, o el
+      # hooks.json de registrar el Stop, el aviso se apaga en silencio.
+      - name: aviso de flip de backend (router + Stop hook)
+        run: |
+          set -euo pipefail
+          grep -q 'noteBackend(req, ur)' plugins/local-router/bin/claude-router.js \
+            || { echo "::error::forward() ya no llama a noteBackend: el aviso de flip esta muerto"; exit 1; }
+          grep -q 'backend_flip_notify.py' plugins/local-router/hooks/hooks.json \
+            || { echo "::error::hooks.json ya no registra el Stop hook de flip"; exit 1; }
+          python3 -m unittest plugins/local-router/scripts/test_backend_flip_notify.py -v
+          node tests/smoke-backend-flip.js

@@ -9,6 +9,17 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/backend_flip_notify.py\"",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
