@@ -6,13 +6,13 @@ Plugin público de Claude Code (marketplace `claude-local-router`, plugin `local
 
 - Claude Code (hook `SessionStart` y comandos `/local-router:install`, `/local-router:status`, `/local-router:reload`).
 - El router empaquetado escucha en `127.0.0.1` y enruta por nombre de modelo: los que casan `CLAUDE_ROUTER_LOCAL_RE` van a la pasarela local (LiteLLM, vLLM, OpenRouter) y el resto a `api.anthropic.com` sin tocar el cuerpo.
-- Versión del router: 2.7.0 según el último commit (`8a9b09f`, 26-09-2026); el plugin dice 2.0.0 en el marketplace: desalineado (no verificado cuál manda).
+- Versión: `plugins/local-router/.claude-plugin/plugin.json` 2.7.0 (commit `f159858`, #21, 26-09-2026, aviso dentro de la sesión cuando cambia el backend); `.claude-plugin/marketplace.json` sigue en 2.0.0: desalineado.
 
 ## Dependencias (en ambos sentidos)
 
 - Depende de: `proxy-claude` (fuente de `bin/claude-router.js`; su workflow `bundle-drift.yml` comprueba que las dos copias coinciden), una pasarela compatible con OpenAI/Anthropic y el panel DGX para la configuración de enrutado (`CLAUDE_ROUTER_ROUTING_CONFIG_URL`).
 - Dependen de él: todas las sesiones de Claude Code que instalan el plugin; su hook reescribe `~/.local/bin/claude-router.js` en cada sesión.
-- Estado medido el 01-10-2026: las dos copias son idénticas (599 líneas, `diff` vacío).
+- Las dos copias deben coincidir; lo comprueba `bundle-drift.yml` en `proxy-claude`.
 
 ## Stack
 
@@ -34,7 +34,7 @@ Un cambio de comportamiento del router NO se hace aquí; aquí solo cambian el e
 
 ## CI/CD y despliegue
 
-`.github/workflows/bundle.yml` (runner `ubuntu-latest`, no `arc-k8s`; ver Decisiones): `node --check` del router empaquetado, `deploy.sh` coherente con el binario, el hook sigue apuntando al desplegador, `settings_env` respeta el modo frente y aviso de cambio de backend. Se instala por `/plugin marketplace add` y el hook `SessionStart`.
+`.github/workflows/bundle.yml` (runner `ubuntu-latest`, no `arc-k8s`; ver Decisiones): `node --check` del router empaquetado, `deploy.sh` coherente con el binario, el hook sigue apuntando al desplegador, `settings_env` respeta el modo frente y aviso de cambio de backend; además los workflows estándar `duplicados.yml` y `pr-review.yml`. Se instala por `/plugin marketplace add` y el hook `SessionStart`.
 
 ## Decisiones y trampas
 
