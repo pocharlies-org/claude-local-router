@@ -16,7 +16,7 @@ on:
 
 jobs:
   bundle:
-    runs-on: ubuntu-latest
+    runs-on: arc-k8s
     steps:
       - uses: actions/checkout@v4
 
