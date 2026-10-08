@@ -67,8 +67,11 @@
 // "Por que ya no hay desvio a Opus" en el README. A Opus se va solo si lo elige el usuario.
 // La UNICA excepcion es la puerta claude de INFRA-208: no es automatica, es la voluntad
 // EXPLICITA del operador en el panel (plan de la sesion = claude), y se loguea por peticion.
+// Un 429 de Anthropic deja ademas la linea `LIMITE-429 src=h:xxxxxxxx model=... error.type=...
+// headers={anthropic-ratelimit-*, retry-after}` (SC-2161 P1; solo log, sin variable de entorno:
+// el reenvio no cambia).
 // SIGHUP recarga el fichero de entorno. GET /-/health devuelve contadores.
-const http = require('http'), https = require('https'), fs = require('fs'), os = require('os'), path = require('path');
+const http = require('http'), https = require('https'), fs = require('fs'), os = require('os'), path = require('path'), crypto = require('crypto');
 
 const PORT = Number(process.env.CLAUDE_ROUTER_PORT || 18791);
 const LOCAL_RE = new RegExp(process.env.CLAUDE_ROUTER_LOCAL_RE || '^(qwen|tooling|or-|alibaba-|q38-|litellm/)', 'i');
@@ -398,7 +401,30 @@ function noteBackend(req, ur) {
   } catch (e) { log(`flip ERROR ${e.message}`); }
 }
 
-function forward(req, res, target, headers, body, tag, trackCompany) {
+// --- observar el 429 de limite de Anthropic (SC-2161 P1) ---------------------------------
+// SOLO log, sin tocar el reenvio: la linea LIMITE-429 deja la captura real (cabeceras
+// anthropic-ratelimit-*, retry-after y error.type) con la que se fijara la regla de «sin cuota»
+// antes de construir ningun desvio entre cuentas. `src` es h: + 8 hex de sha256 del token del
+// Bearer: el token NUNCA va en claro al log. El cuerpo del 429 se lee en un 'data' aparte del
+// pipe (tope 64 KiB); cualquier fallo aqui solo loggea.
+const safe = (v) => String(v).replace(/[^\w.:\/-]/g, '').slice(0, 64) || '-';
+function logLimit429(ur, headers, model) {
+  const bufs = []; let n = 0;
+  ur.on('data', (c) => { if (n < 65536) { bufs.push(c); n += c.length; } });
+  ur.on('end', () => {
+    try {
+      let et = '-';
+      try { et = JSON.parse(Buffer.concat(bufs).toString('utf8')).error.type; } catch {}
+      const tok = String(headers.authorization || headers['x-api-key'] || '').replace(/^Bearer\s+/i, '');
+      const src = tok ? `h:${crypto.createHash('sha256').update(tok).digest('hex').slice(0, 8)}` : '-';
+      const hs = {};
+      for (const [k, v] of Object.entries(ur.headers)) if (k === 'retry-after' || k.startsWith('anthropic-ratelimit-')) hs[k] = v;
+      log(`LIMITE-429 src=${src} model=${safe(model ?? '-')} error.type=${safe(et)} headers=${JSON.stringify(hs)}`);
+    } catch (e) { log(`LIMITE-429 ERROR ${e.message}`); }
+  });
+}
+
+function forward(req, res, target, headers, body, tag, trackCompany, model) {
   const t0 = Date.now();
   let cid = null;
   if (trackCompany) { cid = ++companySeq; companyInflight.set(cid, 'pendiente'); }
@@ -416,6 +442,7 @@ function forward(req, res, target, headers, body, tag, trackCompany) {
     noteBackend(req, ur);
     res.writeHead(ur.statusCode, ur.headers);
     ur.pipe(res);
+    if (ur.statusCode === 429 && target === ANTHROPIC) logLimit429(ur, headers, model);
     ur.on('end', () => log(`${tag} ${ur.statusCode} ${Date.now() - t0}ms ${req.method} ${req.url}`));
     // Un stream cortado a medias emite 'error': sin oyente eso es un proceso muerto.
     ur.on('error', (e) => log(`${tag} ERROR stream ${e.message}`));
@@ -505,7 +532,7 @@ const server = http.createServer((req, res) => {
         }
       }
       stats.anthropic++;
-      return forward(req, res, ANTHROPIC, hdrs, outBody, tag);
+      return forward(req, res, ANTHROPIC, hdrs, outBody, tag, undefined, (payload && payload.model) || model);
     };
     const sendLocal = () => {
       if (payload && payload.thread !== undefined && /^\/v1\/messages(\?|$)/.test(req.url)) {
