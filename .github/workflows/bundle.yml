@@ -112,3 +112,9 @@ jobs:
             || { echo "::error::hooks.json ya no registra el Stop hook de flip"; exit 1; }
           python3 -m unittest plugins/local-router/scripts/test_backend_flip_notify.py -v
           node tests/smoke-backend-flip.js
+
+      # 08-10-2026 (SC-2094): un timeout leyendo /api/model-routing/config cacheaba null y el
+      # gate caia al entorno del unit (solo Opus): cada Sonnet de la compania se reescribia al
+      # qwen. routingConfig() sirve ahora la ultima config buena; este smoke lo protege.
+      - name: routing-config sirve la ultima config buena ante error/timeout
+        run: node tests/smoke-routing-config-stale.js

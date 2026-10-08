@@ -136,6 +136,7 @@ const stats = { started: new Date().toISOString(), anthropic: 0, litellm: 0, err
 const ROUTING_CONFIG_URL = process.env.CLAUDE_ROUTER_ROUTING_CONFIG_URL
   || 'http://10.43.80.147:9002/api/model-routing/config';
 const ROUTING_CONFIG_TTL_MS = Number(process.env.CLAUDE_ROUTER_ROUTING_CONFIG_TTL_MS || 60000);
+const ROUTING_CONFIG_TIMEOUT_MS = Number(process.env.CLAUDE_ROUTER_ROUTING_CONFIG_TIMEOUT_MS || 5000);
 const PLAN_MODEL = process.env.CLAUDE_ROUTER_CLAUDE_PLAN_MODEL || 'claude-opus-5';
 const PLAN_BETA = (() => {
   const v = process.env.CLAUDE_ROUTER_CLAUDE_PLAN_BETA ?? 'context-1m-2025-08-07';
@@ -162,28 +163,41 @@ const PLAN_MAX_TOKENS = Number(process.env.CLAUDE_ROUTER_CLAUDE_PLAN_MAX_TOKENS 
 const FORCE_HEADER = 'x-claude-router-force-local';
 const FORCE_MAX_TOKENS = Number(process.env.CLAUDE_ROUTER_FORCE_LOCAL_MAX_TOKENS ?? 32000);
 
+// Stale-while-error (SC-2094): si la lectura falla (error, timeout, no-200 o JSON ilegible)
+// se SIRVE la ultima config buena y se reintenta al siguiente TTL. Antes se cacheaba null
+// 60 s y, sin config, claudeGate() caia al entorno del unit (solo Opus): cada Sonnet de la
+// compania se reescribia en silencio a qwen. Sin ninguna config buena previa sigue siendo
+// null => sin desvio (fail-safe de siempre).
 const routingCache = { cfg: null, expires: 0, inflight: null };
 function routingConfig() {
   const now = Date.now();
   if (now < routingCache.expires) return Promise.resolve(routingCache.cfg);
   if (routingCache.inflight) return routingCache.inflight; // single-flight
   routingCache.inflight = new Promise((resolve) => {
-    const done = (cfg) => {
-      routingCache.cfg = cfg;
+    let settled = false;
+    const done = (fresh, why) => {
+      if (settled) return;
+      settled = true;
+      if (fresh) routingCache.cfg = fresh;
+      else log(`routing-config ERROR ${why}; ${routingCache.cfg ? 'sirve la ultima config buena' : 'fail-safe = sin desvio'}`);
       routingCache.expires = Date.now() + ROUTING_CONFIG_TTL_MS;
       routingCache.inflight = null;
-      resolve(cfg);
+      resolve(routingCache.cfg);
     };
-    const rq = http.get(ROUTING_CONFIG_URL, { timeout: 2000 }, (r) => {
+    const rq = http.get(ROUTING_CONFIG_URL, { timeout: ROUTING_CONFIG_TIMEOUT_MS }, (r) => {
       let buf = '';
       r.setEncoding('utf8');
       r.on('data', (c) => { buf += c; if (buf.length > 65536) r.destroy(); });
       r.on('end', () => {
-        try { done(r.statusCode === 200 ? JSON.parse(buf) : null); } catch { done(null); }
+        if (r.statusCode !== 200) return done(null, `status ${r.statusCode}`);
+        try {
+          const cfg = JSON.parse(buf);
+          if (cfg && typeof cfg === 'object') done(cfg); else done(null, 'config no es un objeto');
+        } catch (e) { done(null, `json ilegible: ${e.message}`); }
       });
     });
     rq.on('timeout', () => rq.destroy(new Error('timeout')));
-    rq.on('error', (e) => { log(`routing-config ERROR ${e.message}; fail-safe = sin desvio`); done(null); });
+    rq.on('error', (e) => done(null, e.message));
   });
   return routingCache.inflight;
 }
