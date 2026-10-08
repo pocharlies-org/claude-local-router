@@ -187,14 +187,16 @@ function routingConfig() {
   });
   return routingCache.inflight;
 }
-function planIsClaude(cfg, sid) {
+function planIsClaude(cfg, sid, namedLocal) {
   if (!cfg || typeof cfg !== 'object') return false;
   const plans = (cfg.session_plans && typeof cfg.session_plans === 'object') ? cfg.session_plans : {};
   // Entrada explicita de la sesion gana SIEMPRE (incluso para decir "no claude").
   if (sid && Object.prototype.hasOwnProperty.call(plans, sid)) return plans[sid] === 'claude';
   // Default solo con sticky activo: misma semantica que el hook de LiteLLM (los flags
   // gobiernan los mecanismos automaticos; sin sticky, el default_plan no aplica).
-  return cfg.sticky === true && cfg.default_plan === 'claude';
+  // Y solo para quien no trae eleccion propia (DGX-744): si el cliente pidio el modelo
+  // local por nombre, esa ES su eleccion y un default global no la pisa.
+  return !namedLocal && cfg.sticky === true && cfg.default_plan === 'claude';
 }
 
 // --- interruptor «Claude» de la compania (23-09-2026) ------------------------------
@@ -498,6 +500,7 @@ const server = http.createServer((req, res) => {
     let payload = null;
     try { payload = JSON.parse(body.toString('utf8')); } catch {} // no parsea: se reenvia tal cual
     let model = (payload && payload.model) || '?';
+    const namedLocal = LOCAL_RE.test(model); // antes de la marca: lo que el cliente eligio
     const force = String(req.headers[FORCE_HEADER] || '').trim();
     const h = { ...req.headers }; delete h.host; delete h['transfer-encoding']; delete h[FORCE_HEADER];
     if (force && payload && LOCAL_RE.test(force) && !LOCAL_RE.test(model)) {
@@ -557,7 +560,7 @@ const server = http.createServer((req, res) => {
       const sid = req.headers['x-claude-code-session-id'] || req.headers['x-litellm-session-id'] || '';
       if (!payload) return sendLocal(); // body ilegible: no hay desvio posible
       return routingConfig().then((cfg) => {
-        if (!planIsClaude(cfg, sid)) return sendLocal();
+        if (!planIsClaude(cfg, sid, namedLocal)) return sendLocal();
         // Interruptor «Claude» de la compania: un plan=claude no la saca a Anthropic.
         if (isCompany(req) && companyClaudeOff(cfg)) {
           log(`PLAN-CLAUDE ignorado: compania con Claude desactivado model=${model} sid=${sid || '-'}`);
