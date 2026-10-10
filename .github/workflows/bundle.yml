@@ -19,6 +19,8 @@ jobs:
     runs-on: arc-k8s
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # el check de versión compara contra la base de la PR
 
       - uses: actions/setup-node@v4
         with:
@@ -112,3 +114,12 @@ jobs:
             || { echo "::error::hooks.json ya no registra el Stop hook de flip"; exit 1; }
           python3 -m unittest plugins/local-router/scripts/test_backend_flip_notify.py -v
           node tests/smoke-backend-flip.js
+
+      # Cambiar el router o sus scripts sin subir plugin.json: la caché no se renueva y el
+      # SessionStart revierte el router a los bytes viejos (SC-2296).
+      - name: la versión del plugin sube con cada cambio del router
+        if: github.event_name == 'pull_request'
+        run: tests/check-plugin-version.sh "${{ github.event.pull_request.base.sha }}" HEAD
+
+      - name: el check de versión funciona
+        run: bash tests/test-check-plugin-version.sh

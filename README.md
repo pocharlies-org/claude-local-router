@@ -75,6 +75,8 @@ thing that deploys the router** — there is no separate router install:
 - The deployed bytes change **only when you update the plugin** (updating rewrites the cache
   with the new bundled binary). So *to deploy a new router, you update the plugin* — that is
   the whole dependency, enforced by structure, not docs.
+- Cambiar el router = subir la versión del plugin (`plugins/local-router/.claude-plugin/plugin.json`);
+  si no, el `SessionStart` redespliega los bytes viejos de la caché. `bundle.yml` falla la PR que lo olvide.
 - `/local-router:install` runs the same deployer with `--force` for an immediate redeploy.
 
 `deploy.sh` (bundled in the plugin) does the actual work: copies the router to
