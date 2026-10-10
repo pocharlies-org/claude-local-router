@@ -70,8 +70,14 @@
 // Un 429 de Anthropic deja ademas la linea `LIMITE-429 src=h:xxxxxxxx model=... error.type=...
 // headers={anthropic-ratelimit-*, retry-after}` (SC-2161 P1; solo log, sin variable de entorno:
 // el reenvio no cambia).
+//   CLAUDE_ROUTER_FAILOVER_FILE  ('' = apagado) SC-2161 P3: el orden de cuentas que escribe company-agent
+//                            (file.claude-failover.v1). Con `vivo: true`, una sesion en vivo sin cuota sigue
+//                            en otra cuenta. Ver "desvio de cuenta" abajo y en el README.
+//   CLAUDE_ROUTER_ACCOUNTS_DIR   (~/.config/claude-cuentas) de donde salen los `<id>.token` del desvio.
+//   CLAUDE_ROUTER_SIN_CREDITOS   ('' = apagado; '1') una respuesta servida con creditos de uso no llega a
+//                            una sesion en vivo: otra cuenta o un 429 de limite. No depende de `vivo`.
 // SIGHUP recarga el fichero de entorno. GET /-/health devuelve contadores.
-const http = require('http'), https = require('https'), fs = require('fs'), os = require('os'), path = require('path'), crypto = require('crypto');
+const http = require('http'), https = require('https'), fs = require('fs'), os = require('os'), path = require('path'), crypto = require('crypto'), zlib = require('zlib');
 
 const PORT = Number(process.env.CLAUDE_ROUTER_PORT || 18791);
 const LOCAL_RE = new RegExp(process.env.CLAUDE_ROUTER_LOCAL_RE || '^(qwen|tooling|or-|alibaba-|q38-|litellm/)', 'i');
@@ -424,7 +430,227 @@ function logLimit429(ur, headers, model) {
   });
 }
 
-function forward(req, res, target, headers, body, tag, trackCompany, model) {
+// --- desvio de cuenta sin cuota y sin creditos (SC-2161 P3) ---------------------------------
+// CONTRACT: file.claude-failover.v1
+// CONTRACT: file.claude-cuentas.v1
+// Una sesion EN VIVO cuya cuenta se queda sin cuota sigue en otra, sin intervencion. MISMO modelo, mismo cuerpo, mismas
+// cabeceras: solo cambia `authorization` (leccion del 17-09: nada de reescribir `model` ni `max_tokens`). El orden y el umbral
+// NO se deciden aqui: los escribe company-agent (x86-host-runtime) en CLAUDE_ROUTER_FAILOVER_FILE desde company_cuenta.reparto();
+// el router solo lo lee y aprende de lo que le contesta Anthropic. Los tokens son los setup-token de un ano de `<id>.token`
+// (CLAUDE_ROUTER_ACCOUNTS_DIR); nunca un .credentials.json (su refresh rota y lo pisariamos).
+// Sin creditos (CLAUDE_ROUTER_SIN_CREDITOS=1, no depende de `vivo`): una cuenta con los creditos de uso activados no da 429 al
+// agotar su ventana, se sirve con creditos y la sesion sigue gastando sin aviso. Esa respuesta no llega al cliente: se corta,
+// se prueba otra cuenta si el desvio esta encendido y, si no hay, sale un 429 de limite que el CLI ensena como tal.
+// Elegible: Bearer sin x-api-key; ni compania (x-claude-class: su cuenta la gobierna el bus), ni modelo local, ni forzada a local;
+// y el desvio encendido (fichero con v=1, `vivo: true`, `generado` de menos de 10 min, destino api.anthropic.com o el fake local
+// de los smokes) o CLAUDE_ROUTER_SIN_CREDITOS=1. Todo lo demas, como hoy. El token no sale nunca hacia otro host, ni a un log,
+// ni a /-/health.
+const FAILOVER_FILE = (process.env.CLAUDE_ROUTER_FAILOVER_FILE || '').trim();
+const ACCOUNTS_DIR = process.env.CLAUDE_ROUTER_ACCOUNTS_DIR || path.join(os.homedir(), '.config', 'claude-cuentas');
+const SIN_CREDITOS = process.env.CLAUDE_ROUTER_SIN_CREDITOS === '1';
+const FAILOVER_HOST_OK = (ANTHROPIC.protocol === 'https:' && ANTHROPIC.hostname === 'api.anthropic.com') || ANTHROPIC.hostname === '127.0.0.1';
+const TOKEN_ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/; // la clase del contrato: nunca se construye una ruta con otro id
+const TOPE = 65536, FO_MAX = 256, U = 'anthropic-ratelimit-unified-';
+// desvios: src -> {a, desde, hasta, peticiones}; negra: id -> hasta (no es destino); sinCuota: src -> {hasta, h, creditos}
+const fo = { visto: 0, mtime: null, cfg: null, tokens: new Map(), porHash: new Map(), desvios: new Map(), negra: new Map(),
+  sinCuota: new Map(), stats: { intentos: 0, exitos: 0, sin_cuenta: 0, creditos: 0 } };
+const sha256 = (t) => crypto.createHash('sha256').update(t).digest('hex');
+const ahoraS = () => Math.floor(Date.now() / 1000);
+function poner(m, k, v) { m.delete(k); m.set(k, v); if (m.size > FO_MAX) m.delete(m.keys().next().value); }
+
+// «Sin cuota» = 429 con la senal unificada de suscripcion: estado rechazado y reclamo de 5 h o semanal. Solo cabeceras: el
+// cuerpo llega comprimido (br en la captura real, tests/fixtures/429-limite-7d.json). Un 429 sin esa senal no se desvia.
+function esLimiteDeCuenta(status, h) {
+  return status === 429 && h[`${U}status`] === 'rejected' && ['five_hour', 'seven_day'].includes(h[`${U}representative-claim`]);
+}
+// «Con creditos» = lo que el CLI 2.1.296 llama overageInUse o isUsingOverage (su funcion que lee estas cabeceras).
+const usaCreditos = (h) => h[`${U}overage-in-use`] === 'true'
+  || (h[`${U}status`] === 'rejected' && ['allowed', 'allowed_warning'].includes(h[`${U}overage-status`]));
+// El reset de la ventana agotada; si no lo hay (o ya paso), el de los creditos; si tampoco, 10 min.
+const resetDe = (h) => [h[`${U}reset`], h[`${U}overage-reset`]].map(Number).find((r) => r > ahoraS()) || ahoraS() + 600;
+
+// La regla de token valido de file.claude-cuentas.v1 (una linea, sin espacios) y ademas regular, 0600 y nuestro.
+function leerToken(id) {
+  let fd = null;
+  try {
+    fd = fs.openSync(path.join(ACCOUNTS_DIR, `${id}.token`), fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW);
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || (st.mode & 0o077) || st.uid !== process.getuid() || st.size > 4096) return null;
+    const buf = Buffer.alloc(4096);
+    const s = buf.toString('utf8', 0, fs.readSync(fd, buf, 0, 4096, 0));
+    return /^[^\s]+\n?$/.test(s) ? s.trim() : null;
+  } catch { return null; } finally { if (fd !== null) fs.closeSync(fd); }
+}
+
+// El fichero de orden, releido si cambia su mtime (stat como mucho cada 5 s). Con `vivo` apagado no se lee ningun token.
+function failoverCfg() {
+  if (!FAILOVER_FILE || !FAILOVER_HOST_OK) return null;
+  if (Date.now() - fo.visto >= 5000) {
+    fo.visto = Date.now();
+    let m = null;
+    try { m = fs.statSync(FAILOVER_FILE).mtimeMs; } catch {}
+    if (m !== fo.mtime) {
+      fo.mtime = m; fo.cfg = null; fo.tokens.clear(); fo.porHash.clear();
+      try {
+        const d = m === null ? null : JSON.parse(fs.readFileSync(FAILOVER_FILE, 'utf8'));
+        if (d && d.v === 1 && d.vivo === true && typeof d.generado === 'number' && Array.isArray(d.orden)) {
+          const org = d.org && typeof d.org === 'object' ? d.org : {};
+          for (const id of new Set([...d.orden, ...Object.keys(org)])) {
+            const t = typeof id === 'string' && TOKEN_ID_RE.test(id) ? leerToken(id) : null;
+            if (t) { fo.tokens.set(id, t); fo.porHash.set(sha256(t), id); }
+          }
+          fo.cfg = { generado: d.generado, org, orden: d.orden.filter((id) => fo.tokens.has(id)) };
+        }
+      } catch { log('FAILOVER fichero de orden ilegible: sin desvio'); }
+    }
+  }
+  return fo.cfg && ahoraS() - fo.cfg.generado < 600 ? fo.cfg : null;
+}
+
+// Quien es la peticion: el id cuyo token casa con el Bearer o, si ninguno (login por defecto de ~/.claude, su token rota, o el
+// desvio apagado), `h:` + 8 hex de su sha256. null = no elegible.
+function origenDesvio(headers) {
+  const m = /^Bearer\s+(\S+)$/i.exec(String(headers.authorization || ''));
+  if (!m || headers['x-api-key'] || !(failoverCfg() || SIN_CREDITOS)) return null;
+  const h = sha256(m[1]);
+  return fo.porHash.get(h) || `h:${h.slice(0, 8)}`;
+}
+
+function failoverHealth() {
+  const activo = !!failoverCfg();
+  const desvios = activo ? [...fo.desvios].filter(([, d]) => d.hasta > ahoraS())
+    .map(([de, d]) => ({ de, a: d.a, desde: d.desde, hasta: d.hasta, peticiones: d.peticiones })) : [];
+  return { activo, sin_creditos: SIN_CREDITOS, desvios, ...fo.stats };
+}
+
+// Un 429 de limite que el CLI ensena como tal (y deja `error: rate_limit` en el transcript, lo que mueve la conversacion por
+// SC-2267): las cabeceras unificadas de la respuesta que lo decidio, con los creditos rechazados para que no diga «usando creditos».
+function sintetico(m) {
+  const headers = { 'content-type': 'application/json', 'x-should-retry': 'false', 'retry-after': String(Math.max(0, m.hasta - ahoraS())) };
+  for (const [k, v] of Object.entries(m.h)) if (k.startsWith(U)) headers[k] = v;
+  delete headers[`${U}overage-in-use`];
+  Object.assign(headers, { [`${U}status`]: 'rejected', [`${U}overage-status`]: 'rejected', [`${U}reset`]: String(m.hasta) });
+  return { status: 429, headers, body: Buffer.from(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error',
+    message: "This request would exceed your account's rate limit. Please try again later." } })) };
+}
+function emitir(res, r) { if (!res.headersSent) res.writeHead(r.status, r.headers); res.end(r.body); }
+
+// 1. Desvio vigente de esta cuenta: directa al destino. Si el destino se agota, tira de creditos o rechaza el token, fuera el
+//    desvio y vuelta a empezar; cualquier otra respuesta (un 400 de la propia peticion, un 529) llega tal cual.
+// 2. Cuenta sabida sin cuota (una respuesta suya dijo `rejected`) hasta su reset: ni se prueba; a otra cuenta o, si no hay, el
+//    429 sintetico. Sin creditos activos, solo cuando el desvio esta encendido (sin el, como hoy: la prueba Anthropic).
+function desviar(req, res, hdrs, body, tag, model, src) {
+  const cfg = failoverCfg(), d = fo.desvios.get(src), sc = fo.sinCuota.get(src);
+  const x = { req, res, hdrs, body, tag, model, src };
+  if (cfg && d && d.hasta > ahoraS() && fo.tokens.has(d.a)) {
+    return forward(req, res, ANTHROPIC, { ...hdrs, authorization: `Bearer ${fo.tokens.get(d.a)}` }, body, `${tag} FAILOVER-STICKY ${src} -> ${d.a}`, undefined, model, (ur) => {
+      if (!ur) return false;
+      const cred = SIN_CREDITOS && ur.statusCode < 300 && usaCreditos(ur.headers);
+      if (ur.statusCode < 300 && !cred) { d.peticiones++; log(`FAILOVER-STICKY src=${src} -> ${d.a}`); return false; }
+      const lim = cred || esLimiteDeCuenta(ur.statusCode, ur.headers);
+      if (!lim && ur.statusCode !== 401 && ur.statusCode !== 403) return false;
+      poner(fo.negra, d.a, lim ? resetDe(ur.headers) : ahoraS() + 60);
+      fo.desvios.delete(src);
+      log(`FAILOVER-STICKY src=${src} -> ${d.a} ${ur.statusCode}${cred ? ' con creditos' : ''}: se deja el desvio`);
+      if (cred) ur.destroy(); else ur.resume();
+      desviar(req, res, hdrs, body, tag, model, src);
+      return true;
+    });
+  }
+  if (sc && sc.hasta > ahoraS() && (cfg || sc.creditos)) {
+    const orig = sintetico(sc);
+    if (cfg) return probarCandidatos({ ...x, hasta: sc.hasta, creditos: sc.creditos, sintetico: true, original: orig }, 0);
+    fo.stats.creditos++;
+    log(`FAILOVER-SIN-CUENTA-CREDITOS src=${src}: 429 sin salir a Anthropic hasta ${new Date(sc.hasta * 1000).toISOString()}`);
+    return emitir(res, orig);
+  }
+  probarOriginal(x);
+}
+
+// 3. Como hoy, salvo: un 429 de limite con el desvio encendido (se guarda entero, tope 64 KiB, antes de escribir nada) o un 2xx
+//    con creditos con CLAUDE_ROUTER_SIN_CREDITOS=1 (se corta sin escribir nada). Toda respuesta `rejected` deja la marca.
+function probarOriginal(x) {
+  const { req, res, hdrs, body, tag, model, src } = x;
+  forward(req, res, ANTHROPIC, hdrs, body, tag, undefined, model, (ur) => {
+    if (!ur) return false;
+    const cred = SIN_CREDITOS && ur.statusCode < 300 && usaCreditos(ur.headers) && !/count_tokens/.test(req.url);
+    const hasta = resetDe(ur.headers);
+    if (ur.headers[`${U}status`] === 'rejected' || cred) {
+      poner(fo.sinCuota, src, { hasta, h: ur.headers, creditos: SIN_CREDITOS && usaCreditos(ur.headers) });
+      if (TOKEN_ID_RE.test(src)) poner(fo.negra, src, hasta); // que nadie la elija de destino antes de que el panel lo vea
+    }
+    const cfg = failoverCfg();
+    if (cred) {
+      ur.destroy();
+      const orig = sintetico(fo.sinCuota.get(src));
+      if (cfg) { probarCandidatos({ ...x, hasta, creditos: true, sintetico: true, original: orig }, 0); return true; }
+      fo.stats.creditos++;
+      log(`FAILOVER-SIN-CUENTA-CREDITOS src=${src}: la respuesta con creditos no sale; 429`);
+      emitir(res, orig);
+      return true;
+    }
+    if (!cfg || !esLimiteDeCuenta(ur.statusCode, ur.headers)) return false;
+    logLimit429(ur, hdrs, model);
+    const bufs = []; let n = 0;
+    const data = (c) => {
+      bufs.push(c); n += c.length;
+      if (n > TOPE) { ur.off('data', data); ur.off('close', fin); res.writeHead(ur.statusCode, ur.headers); res.write(Buffer.concat(bufs)); ur.pipe(res); }
+    };
+    const fin = () => probarCandidatos({ ...x, hasta, original: { status: ur.statusCode, headers: ur.headers, body: Buffer.concat(bufs) } }, 0);
+    ur.on('data', data); ur.on('close', fin);
+    return true;
+  });
+}
+
+// 4. Hasta 2 candidatos del orden (fuera el origen, su organizacion y la cache negativa). 2xx sin creditos: se emite en
+//    streaming y queda el desvio hasta el reset del origen. Si no, cache negativa (hasta SU reset si esta agotado o con creditos,
+//    60 s si es otro error) y el siguiente. Sin candidato que sirva: el 429 ORIGINAL byte a byte (o el sintetico).
+function probarCandidatos(x, n) {
+  const { req, res, src } = x;
+  if (res.destroyed) return; // el cliente se fue: no se gasta otro intento
+  const cfg = fo.cfg || { orden: [], org: {} };
+  const c = n < 2 && cfg.orden.find((id) => id !== src && !(cfg.org[src] && cfg.org[id] === cfg.org[src])
+    && !(fo.negra.get(id) > ahoraS()) && fo.tokens.has(id));
+  if (!c) {
+    if (x.creditos) fo.stats.creditos++; else fo.stats.sin_cuenta++;
+    log(`FAILOVER-SIN-CUENTA${x.creditos ? '-CREDITOS' : ''} src=${src} intentos=${n}: el 429 ${x.sintetico ? 'sintetico' : 'original'}`);
+    return emitir(res, x.original);
+  }
+  fo.stats.intentos++;
+  forward(req, res, ANTHROPIC, { ...x.hdrs, authorization: `Bearer ${fo.tokens.get(c)}` }, x.body, `${x.tag} FAILOVER ${src} -> ${c}`, undefined, x.model, (ur, err) => {
+    const cred = ur && SIN_CREDITOS && usaCreditos(ur.headers);
+    if (ur && ur.statusCode < 300 && !cred) {
+      fo.stats.exitos++;
+      poner(fo.desvios, src, { a: c, desde: ahoraS(), hasta: x.hasta, peticiones: 1 });
+      log(`FAILOVER src=${src} -> ${c} hasta=${new Date(x.hasta * 1000).toISOString()}`);
+      return false;
+    }
+    const lim = ur && (cred || esLimiteDeCuenta(ur.statusCode, ur.headers));
+    poner(fo.negra, c, lim ? resetDe(ur.headers) : ahoraS() + 60);
+    if (!ur) { log(`FAILOVER-CANDIDATO src=${src} -> ${c} ERROR ${err.code || err.message}`); probarCandidatos(x, n + 1); return true; }
+    if (ur.statusCode < 300) { ur.destroy(); log(`FAILOVER-CANDIDATO src=${src} -> ${c} ${ur.statusCode} con creditos`); probarCandidatos(x, n + 1); return true; }
+    const bufs = []; let k = 0;
+    ur.on('data', (b) => { if (k < TOPE) { bufs.push(b); k += b.length; } });
+    ur.on('close', () => {
+      let t = Buffer.concat(bufs);
+      try { t = ur.headers['content-encoding'] === 'br' ? zlib.brotliDecompressSync(t) : ur.headers['content-encoding'] === 'gzip' ? zlib.gunzipSync(t) : t; } catch {}
+      log(`FAILOVER-CANDIDATO src=${src} -> ${c} ${ur.statusCode} ${t.toString('utf8').slice(0, 200).replace(/[^\x20-\x7e]/g, '.')}`);
+      probarCandidatos(x, n + 1);
+    });
+    return true;
+  });
+}
+
+// Cada 2xx de Anthropic con creditos deja una linea, como LIMITE-429, haga o no algo el router: la primera vez real queda capturada.
+function logCreditos(ur, headers, model) {
+  const tok = String(headers.authorization || headers['x-api-key'] || '').replace(/^Bearer\s+/i, '');
+  const hs = {};
+  for (const [k, v] of Object.entries(ur.headers)) if (k === 'retry-after' || k.startsWith('anthropic-ratelimit-')) hs[k] = v;
+  log(`CREDITOS src=${tok ? `h:${sha256(tok).slice(0, 8)}` : '-'} model=${safe(model ?? '-')} status=${ur.statusCode} headers=${JSON.stringify(hs)}`);
+}
+
+// `intercept(ur, err)`, solo el desvio: si devuelve true se queda con la respuesta (o el error) y `forward` no escribe nada.
+function forward(req, res, target, headers, body, tag, trackCompany, model, intercept) {
   const t0 = Date.now();
   let cid = null;
   if (trackCompany) { cid = ++companySeq; companyInflight.set(cid, 'pendiente'); }
@@ -435,6 +661,10 @@ function forward(req, res, target, headers, body, tag, trackCompany, model) {
     protocol: target.protocol, hostname: target.hostname, port: target.port || undefined, agent: agents[target.protocol],
     method: req.method, path: req.url, headers: { ...headers, host: target.host },
   }, (ur) => {
+    // Un stream cortado a medias emite 'error': sin oyente eso es un proceso muerto.
+    ur.on('error', (e) => log(`${tag} ERROR stream ${e.message}`));
+    if (target === ANTHROPIC && ur.statusCode < 300 && usaCreditos(ur.headers)) logCreditos(ur, headers, model);
+    if (intercept && intercept(ur)) return;
     if (cid !== null) {
       const group = String(ur.headers['x-litellm-model-group'] || '').toLowerCase();
       companyInflight.set(cid, group.startsWith('alibaba-') ? 'alibaba' : 'local');
@@ -444,10 +674,8 @@ function forward(req, res, target, headers, body, tag, trackCompany, model) {
     ur.pipe(res);
     if (ur.statusCode === 429 && target === ANTHROPIC) logLimit429(ur, headers, model);
     ur.on('end', () => log(`${tag} ${ur.statusCode} ${Date.now() - t0}ms ${req.method} ${req.url}`));
-    // Un stream cortado a medias emite 'error': sin oyente eso es un proceso muerto.
-    ur.on('error', (e) => log(`${tag} ERROR stream ${e.message}`));
   });
-  up.on('error', (e) => { log(`${tag} ERROR ${e.code || ''} ${e.message}`); fail(res, 502, `${target.host}: ${e.message}`); });
+  up.on('error', (e) => { log(`${tag} ERROR ${e.code || ''} ${e.message}`); if (!(intercept && intercept(null, e))) fail(res, 502, `${target.host}: ${e.message}`); });
   res.on('close', () => { if (!res.writableFinished) up.destroy(); }); // el cliente se fue: cancela arriba
   if (body !== undefined) up.end(body); else req.pipe(up);
 }
@@ -461,7 +689,7 @@ const server = http.createServer((req, res) => {
   if (req.url === '/-/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, port: PORT, litellm: LITELLM.url.host, local_re: LOCAL_RE.source,
-      mixed: MIXED, bad_keys: BAD_KEYS, ...stats, company_inflight: companyInflightStats() }));
+      mixed: MIXED, bad_keys: BAD_KEYS, ...stats, company_inflight: companyInflightStats(), failover: failoverHealth() }));
   }
   // GET /v1/models: el CLI de Claude valida --model contra esta lista (arranque frio y
   // subagentes la vuelven a pedir). Sin handler cae en el passthrough a api.anthropic.com,
@@ -532,6 +760,9 @@ const server = http.createServer((req, res) => {
         }
       }
       stats.anthropic++;
+      // SC-2161 P3: una sesion en vivo con Bearer, modelo de Anthropic y el desvio encendido puede seguir en otra cuenta.
+      const src = !force && !LOCAL_RE.test(model) && !isCompany(req) ? origenDesvio(hdrs) : null;
+      if (src) return desviar(req, res, hdrs, outBody, tag, (payload && payload.model) || model, src);
       return forward(req, res, ANTHROPIC, hdrs, outBody, tag, undefined, (payload && payload.model) || model);
     };
     const sendLocal = () => {
