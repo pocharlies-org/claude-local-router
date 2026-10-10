@@ -6,7 +6,7 @@ Plugin público de Claude Code (marketplace `claude-local-router`, plugin `local
 
 - Claude Code (hook `SessionStart` y comandos `/local-router:install`, `/local-router:status`, `/local-router:reload`).
 - El router empaquetado escucha en `127.0.0.1` y enruta por nombre de modelo: los que casan `CLAUDE_ROUTER_LOCAL_RE` van a la pasarela local (LiteLLM, vLLM, OpenRouter) y el resto a `api.anthropic.com` sin tocar el cuerpo.
-- Versión: `plugins/local-router/.claude-plugin/plugin.json` 2.7.0 (commit `f159858`, #21, 26-09-2026, aviso dentro de la sesión cuando cambia el backend); `.claude-plugin/marketplace.json` sigue en 2.0.0: desalineado.
+- Versión: `plugins/local-router/.claude-plugin/plugin.json` 2.8.0 (SC-2296; antes 2.7.0, commit `f159858`, #21). `.claude-plugin/marketplace.json` sigue en 2.0.0 desde el inicio: la caché del plugin se renueva con `plugin.json`, no con el marketplace.
 
 ## Dependencias (en ambos sentidos)
 
@@ -34,7 +34,7 @@ Un cambio de comportamiento del router NO se hace aquí; aquí solo cambian el e
 
 ## CI/CD y despliegue
 
-`.github/workflows/bundle.yml` (runner `ubuntu-latest`, no `arc-k8s`; ver Decisiones): `node --check` del router empaquetado, `deploy.sh` coherente con el binario, el hook sigue apuntando al desplegador, `settings_env` respeta el modo frente y aviso de cambio de backend; además los workflows estándar `duplicados.yml` y `pr-review.yml`. Se instala por `/plugin marketplace add` y el hook `SessionStart`.
+`.github/workflows/bundle.yml` (runner `arc-k8s`): en cada PR, `tests/check-plugin-version.sh` exige subir `plugin.json` si cambia `bin/`, `scripts/`, `hooks/` o `commands/` del plugin (la caché no se renueva si no, y el SessionStart revierte el router: cambiar el router = subir la versión del plugin); `node --check` del router empaquetado, `deploy.sh` coherente con el binario, el hook sigue apuntando al desplegador, `settings_env` respeta el modo frente y aviso de cambio de backend; además los workflows estándar `duplicados.yml` y `pr-review.yml`. Se instala por `/plugin marketplace add` y el hook `SessionStart`.
 
 ## Decisiones y trampas
 
@@ -42,5 +42,5 @@ Un cambio de comportamiento del router NO se hace aquí; aquí solo cambian el e
 - El 21-09-2026 el bundle rancio reactivó el desvío a Opus retirado el 17-09 y borró los perfiles de chat de OWU-50 sin que se notara: el hook solo toca teclas si los bytes difieren y siempre diferían.
 - El proxy descarta `authorization` y `x-api-key` y pone la clave del gateway: el OAuth de Anthropic nunca llega al gateway local.
 - Los desvíos automáticos (saturación local → nube, cuota → local) se retiraron el 17-09-2026 con su código; las variables `CLAUDE_ROUTER_QUOTA_*` y `FALLBACK_*` ya no se leen.
-- El job de CI en `ubuntu-latest` debería ir a `arc-k8s` (skill `ci-runners-arc`).
+- El job de CI ya corre en `arc-k8s` (SC-2296 corrige la línea anterior del workflow; ya no hay pendiente).
 - Duplicación: ver C5 de SC-1425.
