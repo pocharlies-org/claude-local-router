@@ -32,7 +32,7 @@ No medido: una captura cruda de un 200 **a través del router**. El router insta
 
 ## Tests
 
-`node tests/smoke-cuota.js` (rama `sc-2337-router-cuota`; primero falló: 6 FAIL y una excepción, la ruta no existía y caía al passthrough):
+`node tests/smoke-cuota.js` (rama `sc-2337-router-cuota`; primero falló: 5 FAIL y una excepción, la ruta no existía y caía al passthrough):
 
 ```
 ok   sin trafico, /-/cuota es {} y no sale a Anthropic
