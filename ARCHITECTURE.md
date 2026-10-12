@@ -6,7 +6,8 @@ Plugin público de Claude Code (marketplace `claude-local-router`, plugin `local
 
 - Claude Code (hook `SessionStart` y comandos `/local-router:install`, `/local-router:status`, `/local-router:reload`).
 - El router empaquetado escucha en `127.0.0.1` y enruta por nombre de modelo: los que casan `CLAUDE_ROUTER_LOCAL_RE` van a la pasarela local (LiteLLM, vLLM, OpenRouter) y el resto a `api.anthropic.com` sin tocar el cuerpo.
-- Versión: `plugins/local-router/.claude-plugin/plugin.json` 2.8.0 (SC-2296; antes 2.7.0, commit `f159858`, #21). `.claude-plugin/marketplace.json` sigue en 2.0.0 desde el inicio: la caché del plugin se renueva con `plugin.json`, no con el marketplace.
+- `GET /-/cuota` (SC-2337, contrato `http.claude-router.cuota.v1`, registrado en `x86-host-runtime-pocharlies/CONTRACTS.yaml`): la última lectura de las cabeceras `anthropic-ratelimit-unified-*` de cada respuesta de Anthropic, por los 16 primeros hex de `sha256(Bearer)` (5 h y 7 d con su reset, `status`, reclamo y `readAt` en epoch s). Solo loopback, solo GET, 403 con `Origin` o `Sec-Fetch-*`; en memoria (se vacía al reiniciar), sin token ni id de cuenta. Lo lee el servicio de cuentas (`claude-account-switcher`), que casa el hash con los tokens que ya conoce.
+- Versión: `plugins/local-router/.claude-plugin/plugin.json` 2.9.0 (SC-2337, `GET /-/cuota`; antes 2.8.0, SC-2296, y 2.7.0, commit `f159858`, #21). `.claude-plugin/marketplace.json` sigue en 2.0.0 desde el inicio: la caché del plugin se renueva con `plugin.json`, no con el marketplace.
 
 ## Dependencias (en ambos sentidos)
 
@@ -30,7 +31,7 @@ Un cambio de comportamiento del router NO se hace aquí; aquí solo cambian el e
 
 ## Tests
 
-`tests/smoke-backend-flip.js` y los unitarios de Python (`test_settings_env.py`, `test_backend_flip_notify.py`).
+`tests/smoke-backend-flip.js`, `tests/smoke-cuota.js` (SC-2337) y los unitarios de Python (`test_settings_env.py`, `test_backend_flip_notify.py`).
 
 ## CI/CD y despliegue
 

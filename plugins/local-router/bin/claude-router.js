@@ -479,6 +479,28 @@ const cortaPorCreditos = (req, ur) => SIN_CREDITOS && ur.statusCode < 300 && usa
 // El reset de la ventana agotada; si no lo hay (o ya paso), el de los creditos; si tampoco, 10 min.
 const resetDe = (h) => [h[`${U}reset`], h[`${U}overage-reset`]].map(Number).find((r) => r > ahoraS()) || ahoraS() + 600;
 
+// --- cuota de cada cuenta, anotada de las respuestas de Anthropic (SC-2337) ---------------------------------------------
+// CONTRACT: http.claude-router.cuota.v1
+// Cada respuesta de Anthropic con la utilizacion de 5 h o de 7 d (cabeceras unificadas) deja aqui su ULTIMA lectura por los 16 primeros
+// hex de sha256(Bearer): nunca el token ni un id de cuenta (el servicio casa el hash con los tokens que ya lee). Solo memoria, acotada
+// como el resto (FO_MAX): observaciones crudas, el router no decide nada con ellas. GET /-/cuota las sirve. Fail-safe: un fallo aqui
+// se loguea una vez y la respuesta al cliente sale igual (se llama antes de escribirla y no toca el stream).
+const cuota = new Map();
+let cuotaWarned = false;
+const ventana = (h, w) => {
+  const utilization = parseFloat(h[`${U}${w}-utilization`]), resetsAt = parseFloat(h[`${U}${w}-reset`]);
+  return Number.isFinite(utilization) ? { utilization, resetsAt: Number.isFinite(resetsAt) ? resetsAt : undefined } : undefined;
+};
+function anotarCuota(headers, ur) {
+  try {
+    const m = /^Bearer\s+(\S+)$/i.exec(String(headers.authorization || ''));
+    const h = ur.headers, fiveHour = ventana(h, '5h'), sevenDay = ventana(h, '7d');
+    if (!m || !(fiveHour || sevenDay)) return;
+    poner(cuota, sha256(m[1]).slice(0, 16), { readAt: ahoraS(), status: h[`${U}status`] && safe(h[`${U}status`]),
+      representativeClaim: h[`${U}representative-claim`] && safe(h[`${U}representative-claim`]), fiveHour, sevenDay });
+  } catch (e) { if (!cuotaWarned) { cuotaWarned = true; log(`CUOTA ERROR ${e.message}`); } }
+}
+
 // La regla de token valido de file.claude-cuentas.v1 (una linea, sin espacios) y ademas regular, 0600 y nuestro.
 function leerToken(id) {
   let fd = null;
@@ -700,6 +722,7 @@ function forward(req, res, target, headers, body, tag, trackCompany, model, inte
   }, (ur) => {
     // Un stream cortado a medias emite 'error': sin oyente eso es un proceso muerto.
     ur.on('error', (e) => log(`${tag} ERROR stream ${e.message}`));
+    if (target === ANTHROPIC) anotarCuota(headers, ur);
     if (tomada(intercept, tag, ur)) return;
     if (target === ANTHROPIC && ur.statusCode < 300 && usaCreditos(ur.headers)) logCreditos(ur, req, model, 'servida con creditos');
     if (cid !== null) {
@@ -727,6 +750,15 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, port: PORT, litellm: LITELLM.url.host, local_re: LOCAL_RE.source,
       mixed: MIXED, bad_keys: BAD_KEYS, ...stats, company_inflight: companyInflightStats(), failover: failoverHealth() }));
+  }
+  // GET /-/cuota (SC-2337): sin credencial, solo loopback (el servidor escucha en 127.0.0.1) y solo GET. Con Origin o Sec-Fetch-*
+  // (un navegador: DNS rebinding) 403. Nunca cae al passthrough: ni el Bearer ni la ruta salen hacia Anthropic.
+  if (/^\/-\/cuota(\?|$)/.test(req.url)) {
+    const deny = (code, extra) => { res.writeHead(code, { 'content-type': 'application/json', ...extra }); res.end(JSON.stringify({ error: code === 405 ? 'solo GET' : 'prohibido' })); };
+    if (req.method !== 'GET') return deny(405, { allow: 'GET' });
+    if (req.headers.origin || Object.keys(req.headers).some((k) => k.startsWith('sec-fetch-'))) return deny(403);
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    return res.end(JSON.stringify(Object.fromEntries(cuota)));
   }
   // GET /v1/models: el CLI de Claude valida --model contra esta lista (arranque frio y
   // subagentes la vuelven a pedir). Sin handler cae en el passthrough a api.anthropic.com,
