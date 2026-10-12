@@ -115,6 +115,10 @@ jobs:
           python3 -m unittest plugins/local-router/scripts/test_backend_flip_notify.py -v
           node tests/smoke-backend-flip.js
 
+      # SC-2337: GET /-/cuota anota la utilizacion 5 h / 7 d de cada respuesta de Anthropic por hash del Bearer.
+      - name: cuota por cuenta (GET /-/cuota)
+        run: node tests/smoke-cuota.js
+
       # Cambiar el router o sus scripts sin subir plugin.json: la caché no se renueva y el
       # SessionStart revierte el router a los bytes viejos (SC-2296).
       - name: la versión del plugin sube con cada cambio del router
