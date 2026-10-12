@@ -7,12 +7,12 @@ Plugin público de Claude Code (marketplace `claude-local-router`, plugin `local
 - Claude Code (hook `SessionStart` y comandos `/local-router:install`, `/local-router:status`, `/local-router:reload`).
 - El router empaquetado escucha en `127.0.0.1` y enruta por nombre de modelo: los que casan `CLAUDE_ROUTER_LOCAL_RE` van a la pasarela local (LiteLLM, vLLM, OpenRouter) y el resto a `api.anthropic.com` sin tocar el cuerpo.
 - `GET /-/cuota` (SC-2337, contrato `http.claude-router.cuota.v1`, registrado en `x86-host-runtime-pocharlies/CONTRACTS.yaml`): la última lectura de las cabeceras `anthropic-ratelimit-unified-*` de cada respuesta de Anthropic, por los 16 primeros hex de `sha256(Bearer)` (5 h y 7 d con su reset, `status`, reclamo y `readAt` en epoch s). Solo loopback, solo GET, 403 con `Origin` o `Sec-Fetch-*`; en memoria (se vacía al reiniciar), sin token ni id de cuenta. Lo lee el servicio de cuentas (`claude-account-switcher`), que casa el hash con los tokens que ya conoce.
-- Versión: `plugins/local-router/.claude-plugin/plugin.json` 2.9.0 (SC-2337, `GET /-/cuota`; antes 2.8.0, SC-2296, y 2.7.0, commit `f159858`, #21). `.claude-plugin/marketplace.json` sigue en 2.0.0 desde el inicio: la caché del plugin se renueva con `plugin.json`, no con el marketplace.
+- Versión: `plugins/local-router/.claude-plugin/plugin.json` 2.10.0 (SC-2349, `deploy.sh` no baja el router; antes 2.9.0, SC-2337, `GET /-/cuota`, 2.8.0, SC-2296, y 2.7.0, commit `f159858`, #21). `.claude-plugin/marketplace.json` sigue en 2.0.0 desde el inicio: la caché del plugin se renueva con `plugin.json`, no con el marketplace.
 
 ## Dependencias (en ambos sentidos)
 
 - Depende de: `proxy-claude` (fuente de `bin/claude-router.js`; su workflow `bundle-drift.yml` comprueba que las dos copias coinciden), una pasarela compatible con OpenAI/Anthropic y el panel DGX para la configuración de enrutado (`CLAUDE_ROUTER_ROUTING_CONFIG_URL`).
-- Dependen de él: todas las sesiones de Claude Code que instalan el plugin; su hook reescribe `~/.local/bin/claude-router.js` en cada sesión.
+- Dependen de él: todas las sesiones de Claude Code que instalan el plugin; su hook reescribe `~/.local/bin/claude-router.js` en cada sesión, salvo que el plugin de esa sesión sea más viejo que el router desplegado (SC-2349): cada despliegue, y también el arranque con el router ya al día y el servicio sano (el no-op rápido), anota `<versión del plugin> <sha256 del router>` en `~/.local/bin/claude-router.version` (temporal + `mv`; nunca rebaja una anotación válida mayor) y `deploy.sh` compara como semver; con una versión menor lo dice una vez en stderr y no toca ni reinicia nada (`--force`, el explícito de `/local-router:install`, sí baja). Un `claude-router.version` cuyo sha no casa con el router (lo reescribió un hook de antes de 2.10.0, que no lo guarda) o que falta no cuenta: se despliega.
 - Las dos copias deben coincidir; lo comprueba `bundle-drift.yml` en `proxy-claude`.
 
 ## Stack
@@ -31,11 +31,11 @@ Un cambio de comportamiento del router NO se hace aquí; aquí solo cambian el e
 
 ## Tests
 
-`tests/smoke-backend-flip.js`, `tests/smoke-cuota.js` (SC-2337) y los unitarios de Python (`test_settings_env.py`, `test_backend_flip_notify.py`).
+`tests/smoke-backend-flip.js`, `tests/smoke-cuota.js` (SC-2337), `tests/test-deploy-version-guard.sh` (SC-2349: `deploy.sh` real en un HOME temporal con `systemctl`/`curl` de mentira) y los unitarios de Python (`test_settings_env.py`, `test_backend_flip_notify.py`).
 
 ## CI/CD y despliegue
 
-`.github/workflows/bundle.yml` (runner `arc-k8s`): en cada PR, `tests/check-plugin-version.sh` exige subir `plugin.json` si cambia `bin/`, `scripts/`, `hooks/` o `commands/` del plugin (la caché no se renueva si no, y el SessionStart revierte el router: cambiar el router = subir la versión del plugin); `node --check` del router empaquetado, `deploy.sh` coherente con el binario, el hook sigue apuntando al desplegador, `settings_env` respeta el modo frente y aviso de cambio de backend; además los workflows estándar `duplicados.yml` y `pr-review.yml`. Se instala por `/plugin marketplace add` y el hook `SessionStart`.
+`.github/workflows/bundle.yml` (runner `arc-k8s`): en cada PR, `tests/check-plugin-version.sh` exige subir `plugin.json` si cambia `bin/`, `scripts/`, `hooks/` o `commands/` del plugin (la caché no se renueva si no, y el SessionStart revierte el router: cambiar el router = subir la versión del plugin); `node --check` del router empaquetado, `tests/test-deploy-version-guard.sh`, `deploy.sh` coherente con el binario, el hook sigue apuntando al desplegador, `settings_env` respeta el modo frente y aviso de cambio de backend; además los workflows estándar `duplicados.yml` y `pr-review.yml`. Se instala por `/plugin marketplace add` y el hook `SessionStart`.
 
 ## Decisiones y trampas
 
@@ -44,4 +44,5 @@ Un cambio de comportamiento del router NO se hace aquí; aquí solo cambian el e
 - El proxy descarta `authorization` y `x-api-key` y pone la clave del gateway: el OAuth de Anthropic nunca llega al gateway local.
 - Los desvíos automáticos (saturación local → nube, cuota → local) se retiraron el 17-09-2026 con su código; las variables `CLAUDE_ROUTER_QUOTA_*` y `FALLBACK_*` ya no se leen.
 - El job de CI ya corre en `arc-k8s` (SC-2296 corrige la línea anterior del workflow; ya no hay pendiente).
+- Un hook anterior a 2.10.0 (sesiones vivas con `CLAUDE_PLUGIN_ROOT` en la caché 2.8.0) lleva el `deploy.sh` sin guarda y puede seguir bajando el router en cada `SessionStart`/compact/clear hasta que se cierre la sesión o se sustituya ese `deploy.sh` en la caché por el actual (que, desde la raíz 2.8.0, ya se niega a bajar).
 - Duplicación: ver C5 de SC-1425.
