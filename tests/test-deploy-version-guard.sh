@@ -12,16 +12,17 @@ fail=0
 
 mkdir -p "$tmp/stub"
 for c in systemctl launchctl; do printf '#!/bin/sh\necho "%s $*" >> "$STUB_LOG"\n' "$c" > "$tmp/stub/$c"; done
-printf '#!/bin/sh\nexit 22\n' > "$tmp/stub/curl"
+# curl de mentira: sano solo si el caso lo pide (HEALTHY=1), que es lo que abre el no-op rápido de deploy.sh
+printf '#!/bin/sh\n[ "${STUB_HEALTHY:-0}" = 1 ] || exit 22\necho "{\\"gateway\\":\\"stub\\"}"\n' > "$tmp/stub/curl"
 chmod +x "$tmp/stub"/*
 
-# plugin <versión>: un plugin instalado (su caché) con su router, que lleva su versión dentro.
+# plugin <versión> [bytes del router]: un plugin instalado (su caché); por defecto su router lleva su versión dentro.
 plugin() {
   local d="$tmp/plugin-$1"
   [ -d "$d" ] && return
   mkdir -p "$d/.claude-plugin" "$d/bin"
   printf '{"name":"local-router","version":"%s"}\n' "$1" > "$d/.claude-plugin/plugin.json"
-  echo "// router $1" > "$d/bin/claude-router.js"
+  echo "${2:-// router $1}" > "$d/bin/claude-router.js"
   cp -r "$src/scripts" "$src/env.example" "$d/"
 }
 
@@ -31,11 +32,12 @@ reset() { rm -rf "$tmp/home"; mkdir -p "$tmp/home/.local/bin" "$tmp/home/.claude
 hook() {
   local v=$1; shift
   plugin "$v"
-  HOME="$tmp/home" PATH="$tmp/stub:$PATH" STUB_LOG="$tmp/calls" CLAUDE_PLUGIN_ROOT="$tmp/plugin-$v" \
+  HOME="$tmp/home" PATH="$tmp/stub:$PATH" STUB_LOG="$tmp/calls" STUB_HEALTHY="${HEALTHY:-0}" CLAUDE_PLUGIN_ROOT="$tmp/plugin-$v" \
     bash "$tmp/plugin-$v/scripts/deploy.sh" "$@" >/dev/null 2>"$tmp/stderr"
   rc=$?
 }
 
+record() { cut -d' ' -f1 "$tmp/home/.local/bin/claude-router.version" 2>/dev/null; }
 deployed() { head -1 "$tmp/home/.local/bin/claude-router.js"; }
 expect() { # <nombre> <esperado> <obtenido>
   if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: esperaba '$2', obtuve '$3'"; fail=1; fi
@@ -69,5 +71,22 @@ expect "--force (explícito) sí baja" "// router 2.8.0" "$(deployed)"
 
 reset; hook 2.9.0; hook 2.9.0 --uninstall
 expect "--uninstall borra también la versión anotada" "" "$(ls "$tmp/home/.local/bin")"
+
+# Router ya al día y servicio sano: deploy.sh sale por el no-op rápido y la guarda tiene que armarse igual.
+# 2.9.1 lleva el mismo router que 2.9.0, como 2.10.0 frente a 2.9.0 (la PR no toca bin/).
+plugin 2.9.0; plugin 2.9.1 "// router 2.9.0"
+
+reset; cp "$tmp/plugin-2.9.0/bin/claude-router.js" "$tmp/home/.local/bin/"; HEALTHY=1 hook 2.9.1
+expect "sano, router igual, sin anotación: anota" 2.9.1 "$(record)"
+expect "  sin temporales a medias" "claude-router.js claude-router.version" "$(ls "$tmp/home/.local/bin" | tr '\n' ' ' | sed 's/ $//')"
+expect "  y sin desplegar ni recargar nada" 0 "$(wc -l < "$tmp/calls")"
+HEALTHY=1 hook 2.8.0
+expect "  después un hook 2.8.0 ya no baja el router" "// router 2.9.0" "$(deployed)"
+
+reset; hook 2.9.1; before=$(cat "$tmp/home/.local/bin/claude-router.version"); HEALTHY=1 hook 2.9.0
+expect "sano y anotación mayor válida: no la toca" "$before" "$(cat "$tmp/home/.local/bin/claude-router.version")"
+
+reset; hook 2.9.0; HEALTHY=1 hook 2.9.1
+expect "sano y anotación menor válida: la sube" 2.9.1 "$(record)"
 
 exit $fail

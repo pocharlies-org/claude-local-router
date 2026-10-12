@@ -77,6 +77,19 @@ deployed_version() {
 }
 # older <a> <b>: a < b as semver (non-numeric => false, so the deploy goes ahead)
 older() { python3 -c 'import sys;v=lambda s:tuple(map(int,s.split(".")));sys.exit(v(sys.argv[1])>=v(sys.argv[2]))' "$1" "$2" 2>/dev/null; }
+# record_version: leaves "<version> <sha>" for the router that is deployed NOW, from every path that
+# ends with this plugin's router in place (a copy, or one that was already current). Never lowers a
+# valid record; written to a temp file and mv'd so a reader never sees half a line; never fails the hook.
+record_version() {
+  [ -n "$VERSION" ] || return 0
+  local d tmp; d="$(deployed_version)"
+  [ "$d" = "$VERSION" ] && return 0
+  if [ -z "$d" ] || older "$d" "$VERSION"; then
+    tmp="$(mktemp "$VERSION_FILE.XXXXXX")" || return 0
+    { printf '%s %s\n' "$VERSION" "$(sha "$BIN")" > "$tmp" && mv "$tmp" "$VERSION_FILE"; } || rm -f "$tmp"
+  fi
+  return 0
+}
 healthy() { curl -fsS -m 3 "http://127.0.0.1:$PORT/-/health" >/dev/null 2>&1; }
 
 # ------------------------------------------------------------------ uninstall
@@ -99,13 +112,14 @@ fi
 # Runs on EVERY SessionStart. When the deployed router already matches the bundled one
 # and the service is healthy, do nothing and print nothing — a hook that talks every
 # session pollutes every session.
+VERSION="$(plugin_version)"
 if [ "${1:-}" != "--force" ] && [ -f "$BIN" ] \
    && [ "$(sha "$BIN")" = "$(sha "$ROUTER_SRC")" ] && healthy; then
+  record_version   # a router that was already current still has to arm the guard (SC-2349)
   exit 0
 fi
 
 # ------------------------------------------------------------------ never downgrade
-VERSION="$(plugin_version)"
 DEPLOYED="$(deployed_version)"
 if [ "${1:-}" != "--force" ] && [ -n "$VERSION" ] && [ -n "$DEPLOYED" ] && older "$VERSION" "$DEPLOYED"; then
   echo "claude-router: no sustituyo el router $DEPLOYED por el $VERSION de este plugin (sesión con el plugin viejo); actualiza el plugin o --force" >&2
@@ -130,7 +144,7 @@ REAL="$("$NODE" -p 'process.execPath' 2>/dev/null || true)"
 # ------------------------------------------------------------------ deploy
 mkdir -p "$HOME/.local/bin" "$ENV_DIR"; chmod 700 "$ENV_DIR"
 cp "$ROUTER_SRC" "$BIN"; chmod 755 "$BIN"
-if [ -n "$VERSION" ]; then printf '%s %s\n' "$VERSION" "$(sha "$BIN")" > "$VERSION_FILE"; else rm -f "$VERSION_FILE"; fi
+record_version
 
 if [ -f "$ENV_FILE" ]; then :; else
   cp "$ENV_EXAMPLE" "$ENV_FILE"; chmod 600 "$ENV_FILE"
