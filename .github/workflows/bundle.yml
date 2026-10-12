@@ -119,6 +119,10 @@ jobs:
       - name: cuota por cuenta (GET /-/cuota)
         run: node tests/smoke-cuota.js
 
+      # SC-2349: una sesión con el plugin viejo no puede bajar el router desplegado.
+      - name: deploy.sh no baja de versión el router desplegado
+        run: bash tests/test-deploy-version-guard.sh
+
       # Cambiar el router o sus scripts sin subir plugin.json: la caché no se renueva y el
       # SessionStart revierte el router a los bytes viejos (SC-2296).
       - name: la versión del plugin sube con cada cambio del router
