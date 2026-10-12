@@ -13,13 +13,13 @@ Nada de lo siguiente imprime ni toca un token, ni reinicia o reconfigura servici
 - `anthropic-ratelimit-unified-7d-utilization` y `anthropic-ratelimit-unified-7d-reset`
 - además: `anthropic-ratelimit-unified-status` (`allowed|allowed_warning|rejected`), `anthropic-ratelimit-unified-representative-claim` (`five_hour|seven_day`) y `anthropic-ratelimit-unified-reset`.
 
-Fuentes que lo prueban, de tres lados distintos:
+Fuentes (las dos primeras hablan de un 200; la tercera, de una captura real a través del router):
 
 1. **El CLI 2.1.296** (`~/.local/share/claude/versions/2.1.296`, `grep -a` de sus cadenas): lee `e.headers.get(`anthropic-ratelimit-unified-${s}-utilization`)` y `...-reset` para `s` en `5h`, `7d`, `7d_oi`, `overage`. Su propia
    comprobación de cuota (`quota_check`) manda `max_tokens: 1` y lee esas cabeceras de la respuesta (`.asResponse()`), o sea de un 200.
 2. **El panel `opencode-claude`** (`~/.local/share/opencode-claude/quota.json`, `source: "probe"`): una llamada real a Messages (`probeAccountQuota` → `recordQuotaFromHeaders(account.id, response.headers, "probe")`), hecha el 12-10 08:04:33Z,
    dejó para una cuenta con `status: allowed` las dos ventanas con utilización y reset. `allowed` no es un 429: es una respuesta de éxito.
-3. **El propio router** ya las lee en un 429 (`esLimiteDeCuenta`, `LIMITE-429`) con estos mismos nombres (`{U}status`, `{U}representative-claim`, `{U}reset`).
+3. **Una captura real del propio router** (`proxy-claude/tests/fixtures/429-limite-7d.json`, 10-10-2026, un 429 de suscripción con el semanal agotado): lleva `anthropic-ratelimit-unified-5h-utilization` (`0.0`), `-5h-reset`, `-5h-status`, `-7d-utilization` (`1.0`), `-7d-reset`, `-7d-status`, `-7d-surpassed-threshold`, `-status`, `-representative-claim` y `-reset`. Las dos ventanas viajan juntas aunque la rechazada sea una. Es un 429, no un 200: el fixture `200-creditos.json` es sintético (lo dice su `_nota`).
 
 No medido: una captura cruda de un 200 **a través del router**. El router instalado no loguea las cabeceras de un 200 (ni `LIMITE-429`: es anterior a SC-2161), y no se reinicia para medirlo. La primera lectura real de `GET /-/cuota` tras el despliegue es la confirmación; si un 200 no las trajera, `/-/cuota` quedaría vacío (la prueba «sin cabeceras → nada» lo cubre) y no rompe nada.
 
@@ -55,7 +55,7 @@ ok   ninguna de esas salio a Anthropic
 ```
 
 - `node tests/smoke-backend-flip.js`: `7/7 checks OK`. `python3 -m unittest plugins/local-router/scripts/test_settings_env.py plugins/local-router/scripts/test_backend_flip_notify.py`: `Ran 16 tests ... OK`.
-- Smokes de `proxy-claude` contra este router: `smoke-plan-gate` 27/27, `smoke-company-inflight` 4/4, `smoke-company-claude-gate` 13/13. `smoke-routing-config-stale` da 4/11 **también con el router de `main` sin tocar** (falla antes de este cambio: espera un timeout por defecto que el router ya no tiene).
+- Los smokes de `proxy-claude` (`tests/smoke-*.js`, los que ejecuta su `smokes.yml`) contra este mismo router: ver la PR de `proxy-claude`.
 - `tests/check-plugin-version.sh origin/main HEAD`: OK (plugin 2.8.0 → 2.9.0). `company-duplicados`: sin duplicación nueva.
 
 ## Criterios

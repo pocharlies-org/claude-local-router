@@ -17,7 +17,7 @@ const crypto = require('crypto');
 const { spawn } = require('child_process');
 
 const ROUTER = process.argv[2] || path.join(__dirname, '..', 'plugins', 'local-router', 'bin', 'claude-router.js');
-const P_ANT = 18941, P_ROUTER = 18942;
+const P_ANT = 18961, P_ROUTER = 18962;
 const U = 'anthropic-ratelimit-unified-';
 const TOKEN_A = 'sk-ant-oat01-CANARIO-A-no-debe-salir-en-ninguna-parte';
 const TOKEN_B = 'sk-ant-oat01-CANARIO-B-no-debe-salir-en-ninguna-parte';
