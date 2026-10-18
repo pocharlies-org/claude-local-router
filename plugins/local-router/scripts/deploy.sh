@@ -40,10 +40,10 @@ PORT="${CLAUDE_ROUTER_PORT:-18791}"
 # proxy-claude/systemd/claude-router.service y un test de CI peta si divergen: aqui
 # hubo un default de dos modelos mientras el router publicaba nueve, y cada sesion
 # nueva se llevaba por delante los cuatro perfiles de chat de OWU-50.
-ROUTER_MODELS="${CLAUDE_ROUTER_MODELS:-${ROUTER_MODELS:-qwen38-flash-next,qwen38-flash-next-uncensored,tooling,alibaba-q38-flash,alibaba-q38-max,qwen38-off,qwen38-u-off}}"
+ROUTER_MODELS="${CLAUDE_ROUTER_MODELS:-${ROUTER_MODELS:-qwen38-flash-next,qwen38-flash-next-uncensored,tooling,alibaba-q38-flash,alibaba-q38-max,qwen38-off,qwen38-u-off,gpt-6.1-sol,gpt-6-astra,gpt-6-sol,gpt-6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna}}"
 # LOCAL_RE decide que NO se va a Anthropic. Sin `q38-` en la regex, los cuatro
 # perfiles de chat pegan contra la API de Anthropic y el CLI corta con 404.
-ROUTER_LOCAL_RE="${CLAUDE_ROUTER_LOCAL_RE:-^(qwen|tooling|or-|alibaba-|q38-|litellm/)}"
+ROUTER_LOCAL_RE="${CLAUDE_ROUTER_LOCAL_RE:-^(qwen|tooling|or-|alibaba-|q38-|litellm/|gpt-)}"
 # FORCE-LOCAL reescribe claude-opus/sonnet -> residente local ANTES de enrutar, para que
 # una sesion nacida en cualquier sitio (movil por RC, Claude Desktop, VS Code) caiga en el
 # mismo modelo: el wrapper de RC solo toca a los hijos con --sdk-url y una sesion

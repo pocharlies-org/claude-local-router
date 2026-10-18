@@ -9,7 +9,7 @@
 //
 // Solo escucha en 127.0.0.1. Sin dependencias. Config por entorno:
 //   CLAUDE_ROUTER_PORT       (18791)
-//   CLAUDE_ROUTER_LOCAL_RE   ('^(qwen|tooling|or-|alibaba-|q38-|litellm/)', case-insensitive)
+//   CLAUDE_ROUTER_LOCAL_RE   ('^(qwen|tooling|or-|alibaba-|q38-|litellm/|gpt-)', case-insensitive)
 //                            `q38-` son los nombres VIEJOS de la matriz de chat
 //                            (OWU-50), hoy puente con caducidad ~27-09 en LiteLLM;
 //                            los nuevos (`qwen38-off`, `qwen38-u-off`) caen ya en
@@ -82,7 +82,7 @@
 const http = require('http'), https = require('https'), fs = require('fs'), os = require('os'), path = require('path'), crypto = require('crypto'), zlib = require('zlib');
 
 const PORT = Number(process.env.CLAUDE_ROUTER_PORT || 18791);
-const LOCAL_RE = new RegExp(process.env.CLAUDE_ROUTER_LOCAL_RE || '^(qwen|tooling|or-|alibaba-|q38-|litellm/)', 'i');
+const LOCAL_RE = new RegExp(process.env.CLAUDE_ROUTER_LOCAL_RE || '^(qwen|tooling|or-|alibaba-|q38-|litellm/|gpt-)', 'i');
 const ENV_FILE = process.env.CLAUDE_ROUTER_ENV_FILE || path.join(os.homedir(), '.config', 'claude-local', 'env');
 const ANTHROPIC = new URL(process.env.CLAUDE_ROUTER_ANTHROPIC_URL || 'https://api.anthropic.com');
 
@@ -775,7 +775,9 @@ const server = http.createServer((req, res) => {
       // alcanzables (LOCAL_RE enruta `q38-`, y LiteLLM los resuelve por puente
       // hasta su caducidad ~27-09); lo que no se publica es la fila.
       || 'qwen38-flash-next,qwen38-flash-next-uncensored,tooling,alibaba-q38-flash,alibaba-q38-max,'
-        + 'qwen38-off,qwen38-u-off')
+        + 'qwen38-off,qwen38-u-off,'
+        // DGX-1053: los GPT de la cuenta ChatGPT Plus de Dani (alias `gpt-*` de LiteLLM).
+        + 'gpt-6.1-sol,gpt-6-astra,gpt-6-sol,gpt-6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna')
       .split(',').map((s) => s.trim()).filter(Boolean);
     const data = ids.map((id) => ({ type: 'model', id, display_name: id, created_at: '2026-01-01T00:00:00Z' }));
     stats.models++;
